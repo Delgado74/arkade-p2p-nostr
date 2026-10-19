@@ -310,3 +310,73 @@ export function parseDisputeResolution(event: Event): DisputeResolution | null {
     event,
   };
 }
+
+/** Build the public dispute announcement (tags only, no agreement). */
+export function buildDisputeAnnounceTemplate(
+  orderId: string,
+  initiator: string,
+  reason: string,
+): EventTemplate {
+  return {
+    kind: DISPUTE_KIND,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [
+      ["d", orderId],
+      ["e", orderId],
+      ["z", "dispute"],
+      ["y", PLATFORM],
+      ["s", "initiated"],
+      ["initiator", initiator],
+      ["reason", reason.slice(0, 500)],
+    ],
+    content: "",
+  };
+}
+
+/** Build a solver's optimistic take of a dispute. Earliest created_at wins. */
+export function buildDisputeTakeTemplate(orderId: string, solverPubKey: string): EventTemplate {
+  return {
+    kind: DISPUTE_TAKE_KIND,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [
+      ["d", orderId],
+      ["e", orderId],
+      ["z", "dispute-take"],
+      ["y", PLATFORM],
+      ["s", "in-progress"],
+      ["solver", solverPubKey],
+    ],
+    content: "",
+  };
+}
+
+/** Build the solver's resolution event (settled/refunded) for a dispute. */
+export function buildDisputeResolutionTemplate(
+  orderId: string,
+  solverPubKey: string,
+  status: "settled" | "refunded",
+  arkTxid?: string,
+): EventTemplate {
+  const tags: string[][] = [
+    ["d", orderId],
+    ["e", orderId],
+    ["z", "dispute-resolution"],
+    ["y", PLATFORM],
+    ["s", status],
+    ["solver", solverPubKey],
+  ];
+  if (arkTxid) tags.push(["ark_txid", arkTxid]);
+  return { kind: DISPUTE_RESOLUTION_KIND, created_at: Math.floor(Date.now() / 1000), tags, content: "" };
+}
+
+/**
+ * Deterministic winner among take events for a dispute: earliest `created_at`,
+ * ties broken by lowest event id. Returns the winning take or null.
+ */
+export function pickDisputeTakeTaker(takes: DisputeTake[]): DisputeTake | null {
+  if (takes.length === 0) return null;
+  return [...takes].sort((a, b) => {
+    if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+    return a.event.id < b.event.id ? -1 : 1;
+  })[0];
+}

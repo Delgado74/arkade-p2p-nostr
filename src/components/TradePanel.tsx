@@ -4,7 +4,7 @@ import { hex } from "@scure/base";
 import type { VirtualCoin } from "@arkade-os/sdk";
 import type { ArkContext } from "../lib/arkade";
 import { pubkeyFromInput, type Identity } from "../lib/identity";
-import { arbiterPubKey } from "../lib/config";
+import { arbiterPubKey, coordinatorPubKey } from "../lib/config";
 import type { NostrClient } from "../lib/nostr";
 import {
   assertFunded,
@@ -34,6 +34,10 @@ import {
   type TradeRole,
 } from "../lib/trade";
 import { sendDm } from "../lib/dm";
+import {
+  buildDisputeAnnounceTemplate,
+  buildDisputeResolutionTemplate,
+} from "../lib/protocol";
 
 /** Prefill produced when a taker presses "Tomar" on an order. */
 export interface TradeRequest {
@@ -83,7 +87,7 @@ function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-/** Newest incoming `dispute`: only the arbiter receives these. */
+/** Newest incoming `dispute`: only solvers in the set receive these. */
 function findActiveDispute(feed: TradeDm[]): TradeMessageOf<"dispute"> | null {
   for (let i = feed.length - 1; i >= 0; i--) {
     const entry = feed[i];
@@ -155,7 +159,7 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
   const [status, setStatus] = useState("");
   // Guards the one-shot automatic "funded" notice the seller sends.
   const announcedRef = useRef(false);
-  // Guards the one-shot "ark_address" claim each party sends to the arbiter.
+  // Guards the one-shot "ark_address" claim each party sends to the solvers.
   const claimedRef = useRef(false);
 
   const arbiter = useMemo(() => {
@@ -166,10 +170,8 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
     }
   }, []);
 
-  const isArbiter = Boolean(identity && arbiter && identity.pubkeyHex === arbiter.toLowerCase());
-
   const activeTake = role === "seller" ? findActiveTake(feed) : null;
-  // Only arbiters receive disputes, so an incoming one means we are the arbiter.
+  // Only solvers receive dispute DMs, so an incoming one means we are a solver.
   const activeDispute = findActiveDispute(feed);
 
   const effectiveOrderId = orderId.trim() || activeTake?.orderId || activeDispute?.orderId || "";
@@ -208,16 +210,27 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
   // double-take where both the order book and this button publish one.
   const takeSent = !!takeMsg || !!request?.buyerArkAddress;
   const escrowMsg = lastOf("escrow");
-  const agreement = escrowMsg?.payload.agreement ?? null;
+  const disputeMsg = lastOf("dispute");
+  // The agreement normally comes from our counterparty's `escrow` DM; a solver
+  // outside the trade only receives it inside an incoming `dispute` DM.
+  const agreement = escrowMsg?.payload.agreement ?? disputeMsg?.payload.agreement ?? null;
   const agreedAddress = escrowMsg?.payload.address ?? "";
   const agreedRefundAddress = escrowMsg?.payload.refundAddress ?? "";
   const buyerArk = lastOf("take")?.payload.buyerArkAddress ?? request?.buyerArkAddress ?? "";
   const pendingRelease = lastOf("release_request");
   const paymentDetails = lastOf("payment_details");
   const fundedMsg = lastOf("funded");
-  const disputeMsg = lastOf("dispute");
   const arbiterDecision = lastOf("arbiter_decision");
   const releaseDone = lastOf("release_done");
+
+  // True when our key is part of the escrow's committed solver set. For a
+  // party the agreement comes from our own escrow DM; for a solver it arrives
+  // inside the dispute DM they are meant to resolve.
+  const isSolver = Boolean(
+    identity &&
+      agreement &&
+      agreement.arbiterPubKeys.some((p) => p.toLowerCase() === identity.pubkeyHex.toLowerCase()),
+  );
 
   // Escrow funding is a public on-chain fact: once either side has seen the
   // VTXO (detected locally or announced) there is nothing left to poll for.
@@ -322,12 +335,18 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
       });
   }, [role, localVtxo, identity, cpPub, effectiveOrderId, client]);
 
-  // Advertise our own Ark payout address to the arbiter (once), so arbitration
-  // never depends on the addresses embedded in a dispute payload.
+  // Advertise our own Ark payout address to every solver in the escrow's
+  // solver set (once), so arbitration never depends on the addresses embedded
+  // in a dispute payload. Each solver authenticates the claim by the sender key.
   useEffect(() => {
-    if (claimedRef.current || !escrowMsg || !arbiter || !identity || !effectiveOrderId) return;
+    if (claimedRef.current || !escrowMsg || !identity || !effectiveOrderId) return;
     const addr = myArk.trim();
     if (!addr) return;
+    const agr = escrowMsg.payload.agreement;
+    const recipients = new Set(agr.arbiterPubKeys.map((p) => p.toLowerCase()));
+    if (arbiter) recipients.add(arbiter.toLowerCase());
+    recipients.delete(identity.pubkeyHex.toLowerCase());
+    if (recipients.size === 0) return;
     claimedRef.current = true;
     const msg: TradeMessageOf<"ark_address"> = {
       app: TRADE_APP,
@@ -337,9 +356,12 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
       role,
       from: identity.pubkeyHex,
       ts: nowSeconds(),
-      payload: { agreement: escrowMsg.payload.agreement, arkAddress: addr },
+      payload: { agreement: agr, arkAddress: addr },
     };
-    sendDm(client.pool, client.relays, identity, arbiter, encodeTradeMessage(msg)).catch(() => {
+    const encoded = encodeTradeMessage(msg);
+    Promise.all(
+      [...recipients].map((r) => sendDm(client.pool, client.relays, identity, r, encoded)),
+    ).catch(() => {
       claimedRef.current = false;
     });
   }, [escrowMsg, arbiter, identity, effectiveOrderId, myArk, role, client]);
@@ -429,9 +451,24 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
   function handleBuildAgreement() {
     if (!identity || !ctx) throw new Error("falta identidad o ASP");
     if (!cpPub) throw new Error("contraparte inválida (npub o hex)");
-    if (!arbiter) throw new Error("árbitro no configurado (VITE_ARBITER)");
     if (!myArk.trim()) throw new Error("indica tu dirección Ark para reembolsos");
     run(async () => {
+      // Solver set comes from the coordinator's replaceable registry event;
+      // fall back to VITE_ARBITER so the app still works without a registry.
+      const registry = await client.fetchSolvers(coordinatorPubKey()).catch(() => null);
+      const fromRegistry = (registry?.solvers ?? [])
+        .map((p) => {
+          try {
+            return pubkeyFromInput(p);
+          } catch {
+            return null;
+          }
+        })
+        .filter((p): p is string => p !== null);
+      const solverSet = fromRegistry.length > 0 ? fromRegistry : arbiter ? [arbiter] : [];
+      if (solverSet.length === 0) {
+        throw new Error("no hay solvers: revisa el registro del coordinador o VITE_ARBITER");
+      }
       const agr: EscrowAgreement = {
         orderId: effectiveOrderId,
         fiat: fiat.trim().toUpperCase(),
@@ -439,7 +476,7 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
         tradeSats: Number(tradeSats),
         buyerPubKey: cpPub,
         sellerPubKey: identity.pubkeyHex,
-        arbiterPubKeys: arbiter ? [arbiter] : [],
+        arbiterPubKeys: solverSet,
         serverPubKey: hex.encode(ctx.serverPubKey),
       };
       const built = buildEscrow(
@@ -456,13 +493,13 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
         address: built.address,
         refundAddress: myArk.trim(),
       });
-      // Advertise our payout address to the arbiter so disputes never rely on
+      // Advertise our payout address to every solver so disputes never rely on
       // the addresses a disputant claims on the counterparty's behalf.
       claimedRef.current = true;
-      void sendTo(arbiter, "ark_address", { agreement: agr, arkAddress: myArk.trim() }).catch(
-        () => undefined,
-      );
-      setStatus(`Escrow acordado. Dirección a fondear: ${built.address}`);
+      void Promise.allSettled(
+        solverSet.map((solver) => sendTo(solver, "ark_address", { agreement: agr, arkAddress: myArk.trim() })),
+      ).catch(() => undefined);
+      setStatus(`Escrow acordado con ${solverSet.length} solver(s). Dirección a fondear: ${built.address}`);
     });
   }
 
@@ -528,24 +565,30 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
     });
   }
 
-  /** Buyer or seller escalates to the configured arbiter. */
+  /** Buyer or seller escalates to every solver in the escrow's solver set. */
   function handleOpenDispute() {
     if (!identity) throw new Error("sin identidad");
-    if (!arbiter) throw new Error("árbitro no configurado (VITE_ARBITER)");
     if (!agreement) throw new Error("aún no hay acuerdo de escrow");
     const buyerAddress = role === "buyer" ? myArk.trim() : buyerArk.trim();
     const sellerAddress = role === "seller" ? myArk.trim() : agreedRefundAddress;
     if (!buyerAddress) throw new Error("falta la dirección Ark del comprador");
     if (!sellerAddress) throw new Error("falta la dirección Ark del vendedor");
     const reason = disputeReason.trim() || "sin motivo especificado";
+    const recipients = [
+      ...new Set(agreement.arbiterPubKeys.map((p) => p.toLowerCase())),
+    ].filter((p) => p !== identity.pubkeyHex.toLowerCase());
+    if (recipients.length === 0) throw new Error("el acuerdo no tiene solvers configurados");
     run(async () => {
-      await sendTo(arbiter, "dispute", {
-        reason,
-        agreement,
-        buyerArkAddress: buyerAddress,
-        sellerArkAddress: sellerAddress,
-      });
-      setStatus("Disputa enviada al árbitro.");
+      // 1. Public announcement (tags only): every solver subscribed to the
+      // dispute kind sees that this order entered a dispute.
+      await client.publish(buildDisputeAnnounceTemplate(effectiveOrderId, identity.pubkeyHex, reason), identity);
+      // 2. Encrypted DMs carrying the agreement to each solver (the agreement
+      // never goes out in clear on the relay).
+      const payload = { reason, agreement, buyerArkAddress: buyerAddress, sellerArkAddress: sellerAddress };
+      await Promise.all(
+        recipients.map((solver) => sendTo(solver, "dispute", payload)),
+      );
+      setStatus(`Disputa publicada y enviada a ${recipients.length} solver(s).`);
     });
   }
 
@@ -573,7 +616,7 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
   /** Arbiter resolves a dispute by spending the escrow via the arbiter leaf. */
   function handleArbiterDecide(outcome: "release_to_buyer" | "refund_to_seller") {
     if (!identity || !ctx) throw new Error("falta identidad o ASP");
-    if (!isArbiter) throw new Error("no eres el árbitro configurado");
+    if (!isSolver) throw new Error("no eres solver de esta disputa");
     if (!disputeMsg) throw new Error("no hay una disputa para resolver");
     const p = disputeMsg.payload;
     const winner: TradeRole = outcome === "release_to_buyer" ? "buyer" : "seller";
@@ -581,7 +624,7 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
     const sats = p.agreement.tradeSats;
     if (!destination) {
       throw new Error(
-        `no tengo la dirección Ark autenticada del ${winner === "buyer" ? "comprador" : "vendedor"}; debe enviarla al árbitro (se envía sola al acordar el escrow)`,
+        `no tengo la dirección Ark autenticada del ${winner === "buyer" ? "comprador" : "vendedor"}; debe enviarla al solver (se envía sola al acordar el escrow)`,
       );
     }
     run(async () => {
@@ -600,10 +643,28 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
       const signed = await signSpend(partial, identity);
       verifyArbiterSpend(esc, held, identity.pubkeyHex, { destination, sats }, signed);
       const arkTxid = await submitSpend(ctx.ark, signed);
-      const payload: TradePayloads["arbiter_decision"] = { outcome, destination, sats, arkTxid };
+      const payload: TradePayloads["arbiter_decision"] = {
+        outcome,
+        destination,
+        sats,
+        arkTxid,
+        solverPubKey: identity.pubkeyHex,
+      };
       await sendTo(p.agreement.buyerPubKey, "arbiter_decision", payload);
       await sendTo(p.agreement.sellerPubKey, "arbiter_decision", payload);
-      setStatus(`Decisión arbitral ejecutada (${outcome}): ${arkTxid}`);
+      // Public resolution so every client agrees the dispute is over.
+      await client
+        .publish(
+          buildDisputeResolutionTemplate(
+            p.agreement.orderId,
+            identity.pubkeyHex,
+            outcome === "release_to_buyer" ? "settled" : "refunded",
+            arkTxid,
+          ),
+          identity,
+        )
+        .catch(() => undefined);
+      setStatus(`Disputa resuelta (${outcome}): ${arkTxid}`);
     });
   }
 
@@ -611,8 +672,8 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
 
   // Authenticated payout addresses the arbiter will actually pay (null until
   // each party has sent its own `ark_address` claim).
-  const authBuyerAddr = isArbiter && disputeMsg ? authenticatedAddress("buyer") : null;
-  const authSellerAddr = isArbiter && disputeMsg ? authenticatedAddress("seller") : null;
+  const authBuyerAddr = isSolver && disputeMsg ? authenticatedAddress("buyer") : null;
+  const authSellerAddr = isSolver && disputeMsg ? authenticatedAddress("seller") : null;
 
   return (
     <section>
@@ -621,9 +682,9 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
         Acuerdo de escrow, métodos de pago, firma cooperativa y disputa/arbitraje por mensajes
         privados cifrados (NIP-17). Todo en mutinynet, fondos de prueba.
       </p>
-      {isArbiter && (
+      {isSolver && (
         <p style={{ color: "#b45309", fontSize: "0.9em" }}>
-          Esta clave es el árbitro configurado: aquí resuelves disputas.
+          Esta clave está en el solver set de este escrow: aquí recibes disputas y las resuelves.
         </p>
       )}
 
@@ -777,7 +838,7 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
       )}
 
       <h3>Disputa y arbitraje</h3>
-      {!isArbiter && (
+      {!isSolver && (
         <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 520 }}>
           <input
             placeholder="motivo de la disputa"
@@ -787,15 +848,15 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
           <div>
             <button
               type="button"
-              disabled={busy || !identity || !agreement || !arbiter}
+              disabled={busy || !identity || !agreement || agreement.arbiterPubKeys.length === 0}
               onClick={handleOpenDispute}
             >
-              Abrir disputa al árbitro
+              Abrir disputa (a los solvers)
             </button>
           </div>
         </div>
       )}
-      {isArbiter && disputeMsg && (
+      {isSolver && disputeMsg && (
         <div style={{ padding: 8, border: "1px solid #8884", borderRadius: 8 }}>
           <div>
             <strong>Disputa</strong> de {disputeMsg.from.slice(0, 12)}…: {disputeMsg.payload.reason}
@@ -844,7 +905,7 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
           </div>
         </div>
       )}
-      {isArbiter && !disputeMsg && <p>Sin disputas entrantes.</p>}
+      {isSolver && !disputeMsg && <p>Sin disputas entrantes.</p>}
       {arbiterDecision && (
         <p style={{ color: "#2563eb" }}>
           Decisión del árbitro:{" "}
