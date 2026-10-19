@@ -134,6 +134,8 @@ function summarize(msg: TradeMessage): string {
       return `decisión del árbitro: ${
         msg.payload.outcome === "release_to_buyer" ? "paga al comprador" : "reembolsa al vendedor"
       } (${msg.payload.arkTxid.slice(0, 16)}…)`;
+    case "chat":
+      return `chat: ${msg.payload.text}`;
     default:
       return "mensaje";
   }

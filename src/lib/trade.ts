@@ -92,6 +92,10 @@ export interface TradePayloads {
     arkTxid: string;
     solverPubKey?: string;
   };
+  /** Free-form evidence chat between a solver and one of the parties (NIP-17). */
+  chat: {
+    text: string;
+  };
 }
 
 /** All message type discriminants. */
@@ -110,6 +114,7 @@ export const TRADE_TYPES = [
   "dispute",
   "dispute_taken",
   "arbiter_decision",
+  "chat",
 ] as const;
 
 export type TradeMessageType = (typeof TRADE_TYPES)[number];
