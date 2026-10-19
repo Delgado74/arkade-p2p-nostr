@@ -36,7 +36,11 @@ import {
 import { sendDm } from "../lib/dm";
 import {
   buildDisputeAnnounceTemplate,
+  buildDisputeTakeTemplate,
   buildDisputeResolutionTemplate,
+  pickDisputeTakeTaker,
+  type DisputeAnnounce,
+  type DisputeTake,
 } from "../lib/protocol";
 
 /** Prefill produced when a taker presses "Tomar" on an order. */
@@ -60,6 +64,10 @@ interface Props {
   client: NostrClient;
   request?: TradeRequest | null;
   feed: TradeDm[];
+  /** Public dispute announcements (kind 38386). */
+  disputeAnnounces?: DisputeAnnounce[];
+  /** Public dispute takes (kind 38387), including competing takes. */
+  disputeTakes?: DisputeTake[];
 }
 
 /**
@@ -131,7 +139,15 @@ function summarize(msg: TradeMessage): string {
   }
 }
 
-export function TradePanel({ identity, ctx, client, request, feed }: Props) {
+export function TradePanel({
+  identity,
+  ctx,
+  client,
+  request,
+  feed,
+  disputeAnnounces = [],
+  disputeTakes = [],
+}: Props) {
   const [role, setRole] = useState<TradeRole>(request?.role ?? "seller");
   const [orderId, setOrderId] = useState(request?.orderId ?? "");
   const [counterparty, setCounterparty] = useState(request?.counterparty ?? "");
@@ -161,6 +177,12 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
   const announcedRef = useRef(false);
   // Guards the one-shot "ark_address" claim each party sends to the solvers.
   const claimedRef = useRef(false);
+  // Optimistic: the take this solver published locally before the event
+  // round-trips back from the relay. Kept with its orderId and solver key so it
+  // never leaks into another dispute or another identity.
+  const [localTake, setLocalTake] = useState<{ orderId: string; solverPubKey: string } | null>(
+    null,
+  );
 
   const arbiter = useMemo(() => {
     try {
@@ -221,6 +243,7 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
   const paymentDetails = lastOf("payment_details");
   const fundedMsg = lastOf("funded");
   const arbiterDecision = lastOf("arbiter_decision");
+  const disputeTakenMsg = lastOf("dispute_taken");
   const releaseDone = lastOf("release_done");
 
   // True when our key is part of the escrow's committed solver set. For a
@@ -231,6 +254,37 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
       agreement &&
       agreement.arbiterPubKeys.some((p) => p.toLowerCase() === identity.pubkeyHex.toLowerCase()),
   );
+
+  // Optimistic take: earliest created_at wins, ties broken by lowest event id,
+  // so every client derives the same winner without a server.
+  const takesForOrder = disputeTakes.filter((t) => t.orderId === effectiveOrderId);
+  const takeTaker = pickDisputeTakeTaker(takesForOrder);
+  const isTaker = Boolean(
+    takeTaker &&
+      identity &&
+      takeTaker.solverPubKey.toLowerCase() === identity.pubkeyHex.toLowerCase(),
+  );
+  const takenByOther = Boolean(takeTaker && !isTaker);
+  // We hold the dispute when we won the public race, or optimistically right
+  // after publishing our own take (before the event round-trips from relays).
+  const localTakeApplies = Boolean(
+    localTake &&
+      identity &&
+      localTake.orderId === effectiveOrderId &&
+      localTake.solverPubKey === identity.pubkeyHex,
+  );
+  // Winning by the public race, or optimistically via our own just-published
+  // take while no other solver has won the race yet.
+  const holdsTake =
+    isTaker ||
+    Boolean(
+      localTakeApplies &&
+        (!takeTaker ||
+          (identity && takeTaker.solverPubKey.toLowerCase() === identity.pubkeyHex.toLowerCase())),
+    );
+  const canTakeDispute = isSolver && Boolean(disputeMsg) && !holdsTake && !takenByOther;
+  const announceForOrder =
+    disputeAnnounces.find((d) => d.orderId === effectiveOrderId) ?? null;
 
   // Escrow funding is a public on-chain fact: once either side has seen the
   // VTXO (detected locally or announced) there is nothing left to poll for.
@@ -593,6 +647,35 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
   }
 
   /**
+   * A solver claims the dispute by publishing an optimistic take. The take is
+   * not exclusive at publish time: every client picks the same winner from all
+   * competing takes (earliest `created_at`, lowest event id on ties), and the
+   * escrow itself only allows a single spend anyway.
+   */
+  function handleTakeDispute() {
+    if (!identity) throw new Error("sin identidad");
+    if (!agreement) throw new Error("aún no hay acuerdo de escrow");
+    if (takenByOther) throw new Error("otro solver ya tomó esta disputa");
+    run(async () => {
+      setLocalTake({ orderId: effectiveOrderId, solverPubKey: identity.pubkeyHex });
+      try {
+        await client.publish(
+          buildDisputeTakeTemplate(effectiveOrderId, identity.pubkeyHex),
+          identity,
+        );
+        // Tell both parties who is resolving, so they can chat with us directly.
+        const payload = { orderId: effectiveOrderId, solverPubKey: identity.pubkeyHex };
+        const parties = [...new Set([agreement.buyerPubKey, agreement.sellerPubKey])];
+        await Promise.all(parties.map((party) => sendTo(party, "dispute_taken", payload)));
+        setStatus("Disputa tomada: pide pruebas a las partes y resuelve cuando tengas evidencias.");
+      } catch (e) {
+        setLocalTake(null);
+        throw e;
+      }
+    });
+  }
+
+  /**
    * The Ark payout address a party confirmed to the arbiter via an
    * authenticated `ark_address` DM. Returns null when no matching claim has
    * arrived, in which case the arbiter must not pay that party.
@@ -613,10 +696,11 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
     return claim.msg.payload.arkAddress.trim() || null;
   }
 
-  /** Arbiter resolves a dispute by spending the escrow via the arbiter leaf. */
+  /** A solver resolves the dispute by spending the escrow via their leaf. */
   function handleArbiterDecide(outcome: "release_to_buyer" | "refund_to_seller") {
     if (!identity || !ctx) throw new Error("falta identidad o ASP");
     if (!isSolver) throw new Error("no eres solver de esta disputa");
+    if (!holdsTake) throw new Error("esta disputa la tomó otro solver");
     if (!disputeMsg) throw new Error("no hay una disputa para resolver");
     const p = disputeMsg.payload;
     const winner: TradeRole = outcome === "release_to_buyer" ? "buyer" : "seller";
@@ -862,6 +946,37 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
             <strong>Disputa</strong> de {disputeMsg.from.slice(0, 12)}…: {disputeMsg.payload.reason}
           </div>
           <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
+            anuncio público:{" "}
+            {announceForOrder ? (
+              <span style={{ color: "#15803d" }}>visto (abierto por {announceForOrder.initiator.slice(0, 12)}…)</span>
+            ) : (
+              <span>esperando propagación…</span>
+            )}
+          </div>
+          <div style={{ fontSize: "0.85em", margin: "4px 0" }}>
+            {takenByOther && (
+              <span style={{ color: "#b45309" }}>
+                Tomada por otro solver ({takeTaker?.solverPubKey.slice(0, 12)}…); tú puedes observar
+                pero no resolver.
+              </span>
+            )}
+            {holdsTake && !takenByOther && (
+              <span style={{ color: "#15803d", fontWeight: 700 }}>
+                La estás resolviendo tú ({identity?.pubkeyHex.slice(0, 12)}…).
+              </span>
+            )}
+          </div>
+          {canTakeDispute && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={handleTakeDispute}
+              style={{ marginBottom: 8 }}
+            >
+              Tomar disputa (publicar take)
+            </button>
+          )}
+          <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
             comprador →{" "}
             {authBuyerAddr ? (
               <span style={{ color: "#15803d", fontWeight: 700 }}>
@@ -885,30 +1000,44 @@ export function TradePanel({ identity, ctx, client, request, feed }: Props) {
               </span>
             )}
           </div>
-          <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button
-              type="button"
-              disabled={busy || !ctx || !authBuyerAddr}
-              title={authBuyerAddr ? undefined : "Falta la dirección autenticada del comprador"}
-              onClick={() => handleArbiterDecide("release_to_buyer")}
-            >
-              Resolver: pagar al comprador
-            </button>
-            <button
-              type="button"
-              disabled={busy || !ctx || !authSellerAddr}
-              title={authSellerAddr ? undefined : "Falta la dirección autenticada del vendedor"}
-              onClick={() => handleArbiterDecide("refund_to_seller")}
-            >
-              Resolver: reembolsar al vendedor
-            </button>
-          </div>
+          {holdsTake && !takenByOther ? (
+            <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                disabled={busy || !ctx || !authBuyerAddr}
+                title={authBuyerAddr ? undefined : "Falta la dirección autenticada del comprador"}
+                onClick={() => handleArbiterDecide("release_to_buyer")}
+              >
+                Resolver: pagar al comprador
+              </button>
+              <button
+                type="button"
+                disabled={busy || !ctx || !authSellerAddr}
+                title={authSellerAddr ? undefined : "Falta la dirección autenticada del vendedor"}
+                onClick={() => handleArbiterDecide("refund_to_seller")}
+              >
+                Resolver: reembolsar al vendedor
+              </button>
+            </div>
+          ) : (
+            <p style={{ fontSize: "0.85em", opacity: 0.7, marginTop: 8 }}>
+              {takenByOther
+                ? "La resolución está en manos del solver que tomó la disputa."
+                : "Toma la disputa para poder resolverla."}
+            </p>
+          )}
         </div>
       )}
       {isSolver && !disputeMsg && <p>Sin disputas entrantes.</p>}
+      {disputeTakenMsg && disputeTakenMsg.payload.solverPubKey.toLowerCase() !== (identity?.pubkeyHex.toLowerCase() ?? "") && (
+        <p style={{ color: "#b45309", fontSize: "0.9em" }}>
+          Disputa tomada por el solver {disputeTakenMsg.payload.solverPubKey.slice(0, 16)}… —
+          escríbele por DM para aportar tus pruebas.
+        </p>
+      )}
       {arbiterDecision && (
         <p style={{ color: "#2563eb" }}>
-          Decisión del árbitro:{" "}
+          Resolución del solver:{" "}
           {arbiterDecision.payload.outcome === "release_to_buyer"
             ? "pagado al comprador"
             : "reembolsado al vendedor"}{" "}

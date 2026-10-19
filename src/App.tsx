@@ -14,7 +14,11 @@ import {
   type TradeMessageOf,
   type TradeRole,
 } from "./lib/trade";
-import type { Order } from "./lib/protocol";
+import type {
+  DisputeAnnounce,
+  DisputeTake,
+  Order,
+} from "./lib/protocol";
 import { isFinished, loadOperations, recordOperation, type OperationRecord } from "./lib/operations";
 import { RatesPanel } from "./components/RatesPanel";
 import { OrderForm } from "./components/OrderForm";
@@ -52,6 +56,11 @@ export default function App() {
   // Bumped after publishing an order so the book refetches immediately instead
   // of waiting for a relay push.
   const [ordersVersion, setOrdersVersion] = useState(0);
+  // Public dispute notifications: every solver subscribed sees these; takes
+  // stay in a list (not deduped by order) so the optimistic winner can be
+  // computed deterministically from all competing takes.
+  const [disputeAnnounces, setDisputeAnnounces] = useState<DisputeAnnounce[]>([]);
+  const [disputeTakes, setDisputeTakes] = useState<DisputeTake[]>([]);
 
   const client = nostrClient();
 
@@ -160,6 +169,29 @@ export default function App() {
     });
     return () => subscription.close();
   }, [identity, client, record]);
+
+  // Live public dispute feed: announcements (who opened) and takes (who is
+  // resolving). Both are needed to show dispute state without a manual reload.
+  useEffect(() => {
+    const announcements = client.subscribeDisputes({
+      onDispute: (d) => {
+        setDisputeAnnounces((prev) =>
+          prev.some((e) => e.event.id === d.event.id) ? prev : [...prev, d],
+        );
+      },
+    });
+    const takes = client.subscribeDisputeTakes({
+      onTake: (t) => {
+        setDisputeTakes((prev) =>
+          prev.some((e) => e.event.id === t.event.id) ? prev : [...prev, t],
+        );
+      },
+    });
+    return () => {
+      announcements.close();
+      takes.close();
+    };
+  }, [client]);
 
   function run<T>(fn: () => Promise<T>) {
     setBusy(true);
@@ -373,6 +405,8 @@ export default function App() {
             client={client}
             request={tradeRequest}
             feed={feed}
+            disputeAnnounces={disputeAnnounces}
+            disputeTakes={disputeTakes}
           />
         ))}
       {tab === "history" && <HistoryPanel operations={operations} />}
