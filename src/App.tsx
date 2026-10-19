@@ -16,6 +16,7 @@ import {
 } from "./lib/trade";
 import type {
   DisputeAnnounce,
+  DisputeResolution,
   DisputeTake,
   Order,
 } from "./lib/protocol";
@@ -26,8 +27,9 @@ import { OrderBook } from "./components/OrderBook";
 import { EscrowHarness } from "./components/EscrowHarness";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { TradePanel, type TradeRequest } from "./components/TradePanel";
+import { ChatPanel } from "./components/ChatPanel";
 
-type Tab = "account" | "rates" | "orders" | "trade" | "history" | "escrow";
+type Tab = "account" | "rates" | "orders" | "trade" | "chat" | "history" | "escrow";
 type AspStatus = "connecting" | "ready" | "error";
 
 let sharedClient: NostrClient | null = null;
@@ -61,6 +63,7 @@ export default function App() {
   // computed deterministically from all competing takes.
   const [disputeAnnounces, setDisputeAnnounces] = useState<DisputeAnnounce[]>([]);
   const [disputeTakes, setDisputeTakes] = useState<DisputeTake[]>([]);
+  const [disputeResolutions, setDisputeResolutions] = useState<DisputeResolution[]>([]);
 
   const client = nostrClient();
 
@@ -187,9 +190,17 @@ export default function App() {
         );
       },
     });
+    const resolutions = client.subscribeDisputeResolutions({
+      onRes: (r) => {
+        setDisputeResolutions((prev) =>
+          prev.some((e) => e.event.id === r.event.id) ? prev : [...prev, r],
+        );
+      },
+    });
     return () => {
       announcements.close();
       takes.close();
+      resolutions.close();
     };
   }, [client]);
 
@@ -282,6 +293,7 @@ export default function App() {
     { id: "rates", label: "Tasas" },
     { id: "orders", label: "Órdenes" },
     { id: "trade", label: "Operación" },
+    { id: "chat", label: "Chat" },
     { id: "history", label: "Historial" },
     { id: "escrow", label: "Escrow" },
   ];
@@ -409,6 +421,17 @@ export default function App() {
             disputeTakes={disputeTakes}
           />
         ))}
+      {tab === "chat" && (
+        <ChatPanel
+          identity={identity}
+          client={client}
+          feed={feed}
+          disputeAnnounces={disputeAnnounces}
+          disputeTakes={disputeTakes}
+          disputeResolutions={disputeResolutions}
+          operations={operations}
+        />
+      )}
       {tab === "history" && <HistoryPanel operations={operations} />}
       {tab === "escrow" && <EscrowHarness identity={identity} ctx={ctx} />}
     </main>
