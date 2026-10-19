@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
 import { connectArkade, type ArkContext } from "./lib/arkade";
 import { generateIdentity, identityFromInput, type Identity } from "./lib/identity";
@@ -19,17 +19,29 @@ import type {
   DisputeResolution,
   DisputeTake,
   Order,
+  OrderType,
 } from "./lib/protocol";
 import { isFinished, loadOperations, recordOperation, type OperationRecord } from "./lib/operations";
+import {
+  buildConversations,
+  buildDisputeRooms,
+  loadReadMarks,
+  saveReadMarks,
+  type ReadMarks,
+} from "./lib/chat";
 import { RatesPanel } from "./components/RatesPanel";
 import { OrderForm } from "./components/OrderForm";
 import { OrderBook } from "./components/OrderBook";
 import { EscrowHarness } from "./components/EscrowHarness";
-import { HistoryPanel } from "./components/HistoryPanel";
+import { OperationsPanel } from "./components/OperationsPanel";
 import { TradePanel, type TradeRequest } from "./components/TradePanel";
 import { ChatPanel } from "./components/ChatPanel";
+import { Sidebar } from "./components/Sidebar";
+import { BottomNav } from "./components/BottomNav";
+import { AddOrderButton } from "./components/AddOrderButton";
+import { BackIcon, MenuIcon } from "./components/icons";
+import type { Screen } from "./components/nav";
 
-type Tab = "account" | "rates" | "orders" | "trade" | "chat" | "history" | "escrow";
 type AspStatus = "connecting" | "ready" | "error";
 
 let sharedClient: NostrClient | null = null;
@@ -42,8 +54,26 @@ function takerRole(order: Order): TradeRole {
   return order.type === "sell" ? "buyer" : "seller";
 }
 
+const SCREEN_META: Record<Screen, { title: string; sub: string }> = {
+  book: { title: "Libro de órdenes", sub: "Compra y vende BTC con escrow en Arkade" },
+  create: { title: "Nueva oferta", sub: "Elige el lado y publica tu orden" },
+  trades: { title: "Mis operaciones", sub: "Operaciones en curso y terminadas" },
+  trade: { title: "Operación", sub: "Escrow, pago fiat y mensajes" },
+  chat: { title: "Chat", sub: "Mensajes y disputas" },
+  account: { title: "Cuenta y claves", sub: "Identidad Nostr/Arkade y conexión con el ASP" },
+  rates: { title: "Tasas", sub: "Precio de referencia y prima" },
+  escrow: { title: "Escrow (pruebas)", sub: "Banco de pruebas del escrow Arkade" },
+};
+
+const BACK_TARGET: Partial<Record<Screen, Screen>> = {
+  create: "book",
+  trade: "trades",
+};
+
 export default function App() {
-  const [tab, setTab] = useState<Tab>("account");
+  const [tab, setTab] = useState<Screen>("book");
+  const [createType, setCreateType] = useState<OrderType>("sell");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [identity, setIdentity] = useState<Identity>(loadOrCreateIdentity);
   const [keyInput, setKeyInput] = useState("");
   const [ctx, setCtx] = useState<ArkContext | null>(null);
@@ -55,6 +85,7 @@ export default function App() {
   const [operations, setOperations] = useState<OperationRecord[]>(() =>
     loadOperations(identity.pubkeyHex),
   );
+  const [readMarks, setReadMarks] = useState<ReadMarks>(() => loadReadMarks(identity.pubkeyHex));
   // Bumped after publishing an order so the book refetches immediately instead
   // of waiting for a relay push.
   const [ordersVersion, setOrdersVersion] = useState(0);
@@ -204,6 +235,44 @@ export default function App() {
     };
   }, [client]);
 
+  // Badges for the menu and the bottom bar. Read marks live here so both
+  // surfaces stay in sync with the chat screen.
+  const conversations = useMemo(
+    () => buildConversations(feed, identity.pubkeyHex, readMarks),
+    [feed, identity.pubkeyHex, readMarks],
+  );
+  const disputeRooms = useMemo(
+    () =>
+      buildDisputeRooms(
+        feed,
+        disputeAnnounces,
+        disputeTakes,
+        disputeResolutions,
+        identity.pubkeyHex,
+        readMarks,
+      ),
+    [feed, disputeAnnounces, disputeTakes, disputeResolutions, identity.pubkeyHex, readMarks],
+  );
+  const chatUnread =
+    conversations.reduce((sum, c) => (c.disputeOnly ? sum : sum + c.unread), 0) +
+    disputeRooms.reduce((sum, d) => sum + d.unread, 0);
+  const activeOps = operations.filter((op) => !isFinished(op.status)).length;
+
+  function navigate(screen: Screen) {
+    setSidebarOpen(false);
+    setTab(screen);
+  }
+
+  function openCreate(type: OrderType) {
+    setCreateType(type);
+    navigate("create");
+  }
+
+  function applyReadMarks(next: ReadMarks) {
+    setReadMarks(next);
+    saveReadMarks(identity.pubkeyHex, next);
+  }
+
   function run<T>(fn: () => Promise<T>) {
     setBusy(true);
     setError("");
@@ -231,6 +300,7 @@ export default function App() {
     saveIdentity(next);
     setIdentity(next);
     setOperations(loadOperations(next.pubkeyHex));
+    setReadMarks(loadReadMarks(next.pubkeyHex));
   }
 
   async function handleTake(order: Order, buyerArkAddress?: string) {
@@ -279,161 +349,244 @@ export default function App() {
       tradeSats: order.amountSats,
       status: "in-progress",
     });
-    setTab("trade");
+    navigate("trade");
   }
 
-  // A finished trade leaves the Operación screen and lives in Historial.
+  function openOperation(orderId: string) {
+    const op = operations.find((entry) => entry.orderId === orderId);
+    if (!op) return;
+    setTradeRequest({
+      orderId: op.orderId,
+      counterparty: op.counterparty,
+      role: op.role,
+      fiat: op.fiat,
+      fiatAmount: op.fiatAmount,
+      tradeSats: op.tradeSats,
+    });
+    navigate("trade");
+  }
+
+  // A finished trade leaves the Operación screen and lives in Mis operaciones.
   const activeOperation = tradeRequest
     ? operations.find((op) => op.orderId === tradeRequest.orderId)
     : undefined;
   const tradeFinished = activeOperation !== undefined && isFinished(activeOperation.status);
 
-  const tabs: { id: Tab; label: string }[] = [
-    { id: "account", label: "Cuenta" },
-    { id: "rates", label: "Tasas" },
-    { id: "orders", label: "Órdenes" },
-    { id: "trade", label: "Operación" },
-    { id: "chat", label: "Chat" },
-    { id: "history", label: "Historial" },
-    { id: "escrow", label: "Escrow" },
-  ];
+  const meta = SCREEN_META[tab];
+  const backTarget = BACK_TARGET[tab];
 
   return (
-    <main style={{ maxWidth: 760, margin: "2rem auto", textAlign: "left" }}>
-      <h1>arkade-p2p-nostr</h1>
-      <p>Cliente P2P Nostr con escrow en Arkade — mutinynet, solo fondos de prueba.</p>
-
-      <nav style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            type="button"
-            onClick={() => setTab(t.id)}
-            style={{ fontWeight: tab === t.id ? "bold" : "normal" }}
-          >
-            {t.label}
-          </button>
-        ))}
-      </nav>
-
-      {error && <p style={{ color: "crimson" }}>Error: {error}</p>}
-
-      {tab === "account" && (
-        <section>
-          <h2>Cuenta</h2>
-          <p style={{ fontSize: "0.85em", opacity: 0.8 }}>
-            Tu clave se genera automáticamente y se guarda en esta pestaña. Cada pestaña o
-            ventana tiene su propia identidad (abre otra para actuar como comprador, vendedor o
-            árbitro). La misma clave sirve para Nostr y para Arkade.
-          </p>
-
-          <dl>
-            <dt>npub</dt>
-            <dd style={{ wordBreak: "break-all" }}>{identity.npub}</dd>
-            <dt>nsec</dt>
-            <dd style={{ wordBreak: "break-all" }}>{identity.nsec}</dd>
-          </dl>
-
-          <div>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => run(async () => applyIdentity(generateIdentity()))}
-            >
-              Generar otra
-            </button>{" "}
-            <input
-              placeholder="nsec1... o hex"
-              value={keyInput}
-              onChange={(e) => setKeyInput(e.target.value)}
-            />
-            <button
-              type="button"
-              disabled={busy || !keyInput}
-              onClick={() =>
-                run(async () => {
-                  applyIdentity(identityFromInput(keyInput));
-                  setKeyInput("");
-                })
-              }
-            >
-              Importar
-            </button>
-          </div>
-
-          <h3>ASP</h3>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <button type="button" disabled={busy} onClick={reconnectAsp}>
-              {aspStatus === "connecting" ? "Conectando…" : "Reconectar"}
-            </button>
-            <span>
-              {aspStatus === "connecting" && "conectando a mutinynet…"}
-              {aspStatus === "ready" && "conectado"}
-              {aspStatus === "error" && "error de conexión"}
-            </span>
-          </div>
-          {ctx && (
-            <dl>
-              <dt>operador</dt>
-              <dd>{ctx.operatorUrl}</dd>
-              <dt>red</dt>
-              <dd>{ctx.info.network}</dd>
-            </dl>
-          )}
-        </section>
-      )}
-
-      {tab === "rates" && <RatesPanel />}
-      {tab === "orders" && (
-        <>
-          <OrderForm
-            client={client}
-            identity={identity}
-            onPublished={() => setOrdersVersion((v) => v + 1)}
-          />
-          <hr />
-          <OrderBook
-            client={client}
-            identity={identity}
-            onTake={handleTake}
-            refreshSignal={ordersVersion}
-          />
-        </>
-      )}
-      {tab === "trade" &&
-        (tradeFinished ? (
-          <section>
-            <h2>Operación</h2>
-            <p>
-              No hay operaciones en curso. Las operaciones terminadas están en{" "}
-              <strong>Historial</strong>.
-            </p>
-          </section>
-        ) : (
-          <TradePanel
-            key={tradeRequest ? `${tradeRequest.orderId}:${tradeRequest.counterparty}` : "manual"}
-            identity={identity}
-            ctx={ctx}
-            client={client}
-            request={tradeRequest}
-            feed={feed}
-            disputeAnnounces={disputeAnnounces}
-            disputeTakes={disputeTakes}
-          />
-        ))}
-      {tab === "chat" && (
-        <ChatPanel
-          identity={identity}
-          client={client}
-          feed={feed}
-          disputeAnnounces={disputeAnnounces}
-          disputeTakes={disputeTakes}
-          disputeResolutions={disputeResolutions}
-          operations={operations}
+    <div className="app">
+      {sidebarOpen && (
+        <button
+          type="button"
+          className="sidebar-scrim"
+          aria-label="Cerrar menú"
+          onClick={() => setSidebarOpen(false)}
         />
       )}
-      {tab === "history" && <HistoryPanel operations={operations} />}
-      {tab === "escrow" && <EscrowHarness identity={identity} ctx={ctx} />}
-    </main>
+      <Sidebar
+        open={sidebarOpen}
+        active={tab}
+        chatUnread={chatUnread}
+        activeOps={activeOps}
+        onNavigate={navigate}
+        onClose={() => setSidebarOpen(false)}
+      />
+
+      <div className="app-main">
+        <header className="topbar">
+          {backTarget ? (
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Volver"
+              onClick={() => navigate(backTarget)}
+            >
+              <BackIcon />
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="icon-button menu-button"
+              aria-label="Abrir menú"
+              onClick={() => setSidebarOpen(true)}
+            >
+              <MenuIcon />
+            </button>
+          )}
+          <div className="topbar-title">
+            <h1>{meta.title}</h1>
+            <p>{meta.sub}</p>
+          </div>
+          <span className="status-chip" data-status={aspStatus} title="Estado del ASP de Arkade">
+            <span className="status-dot" />
+            {aspStatus === "ready"
+              ? "ASP listo"
+              : aspStatus === "connecting"
+                ? "Conectando"
+                : "ASP sin conexión"}
+          </span>
+        </header>
+
+        <div className="content">
+          {error && <p className="alert">Error: {error}</p>}
+
+          {tab === "book" && (
+            <OrderBook
+              client={client}
+              identity={identity}
+              onTake={handleTake}
+              refreshSignal={ordersVersion}
+            />
+          )}
+
+          {tab === "create" && (
+            <OrderForm
+              key={createType}
+              client={client}
+              identity={identity}
+              initialType={createType}
+              onPublished={() => {
+                setOrdersVersion((v) => v + 1);
+                navigate("book");
+              }}
+              onCancel={() => navigate("book")}
+            />
+          )}
+
+          {tab === "trades" && (
+            <OperationsPanel operations={operations} onOpen={openOperation} />
+          )}
+
+          {tab === "trade" &&
+            (tradeFinished ? (
+              <section className="panel">
+                <h2>Operación finalizada</h2>
+                <p className="panel-note">
+                  Esta operación ya terminó; su detalle está en Mis operaciones.
+                </p>
+                <div className="form-actions">
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => navigate("trades")}
+                  >
+                    Ver mis operaciones
+                  </button>
+                </div>
+              </section>
+            ) : (
+              <TradePanel
+                key={
+                  tradeRequest
+                    ? `${tradeRequest.orderId}:${tradeRequest.counterparty}`
+                    : "manual"
+                }
+                identity={identity}
+                ctx={ctx}
+                client={client}
+                request={tradeRequest}
+                feed={feed}
+                disputeAnnounces={disputeAnnounces}
+                disputeTakes={disputeTakes}
+              />
+            ))}
+
+          {tab === "chat" && (
+            <ChatPanel
+              identity={identity}
+              client={client}
+              feed={feed}
+              disputeAnnounces={disputeAnnounces}
+              disputeTakes={disputeTakes}
+              disputeResolutions={disputeResolutions}
+              operations={operations}
+              readMarks={readMarks}
+              onReadMarksChange={applyReadMarks}
+            />
+          )}
+
+          {tab === "account" && (
+            <section className="panel">
+              <p className="panel-note">
+                Tu clave se genera automáticamente y se guarda en esta pestaña. Cada pestaña o
+                ventana tiene su propia identidad (abre otra para actuar como comprador, vendedor
+                o árbitro). La misma clave sirve para Nostr y para Arkade.
+              </p>
+
+              <dl className="kv">
+                <dt>npub</dt>
+                <dd>{identity.npub}</dd>
+                <dt>nsec</dt>
+                <dd>{identity.nsec}</dd>
+              </dl>
+
+              <div className="inline-form">
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={busy}
+                  onClick={() => run(async () => applyIdentity(generateIdentity()))}
+                >
+                  Generar otra
+                </button>
+                <input
+                  className="input"
+                  placeholder="nsec1... o hex"
+                  value={keyInput}
+                  onChange={(e) => setKeyInput(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={busy || !keyInput}
+                  onClick={() =>
+                    run(async () => {
+                      applyIdentity(identityFromInput(keyInput));
+                      setKeyInput("");
+                    })
+                  }
+                >
+                  Importar
+                </button>
+              </div>
+
+              <h3>ASP</h3>
+              <div className="inline-form">
+                <button type="button" className="btn btn-ghost" disabled={busy} onClick={reconnectAsp}>
+                  {aspStatus === "connecting" ? "Conectando…" : "Reconectar"}
+                </button>
+                <span className="panel-note">
+                  {aspStatus === "connecting" && "conectando a mutinynet…"}
+                  {aspStatus === "ready" && "conectado"}
+                  {aspStatus === "error" && "error de conexión"}
+                </span>
+              </div>
+              {ctx && (
+                <dl className="kv">
+                  <dt>operador</dt>
+                  <dd>{ctx.operatorUrl}</dd>
+                  <dt>red</dt>
+                  <dd>{ctx.info.network}</dd>
+                </dl>
+              )}
+            </section>
+          )}
+
+          {tab === "rates" && <RatesPanel />}
+          {tab === "escrow" && <EscrowHarness identity={identity} ctx={ctx} />}
+        </div>
+
+        <BottomNav
+          active={tab}
+          chatUnread={chatUnread}
+          activeOps={activeOps}
+          onNavigate={navigate}
+        />
+      </div>
+
+      {tab === "book" && <AddOrderButton onCreate={openCreate} />}
+    </div>
   );
 }

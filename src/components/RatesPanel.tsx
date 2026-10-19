@@ -34,8 +34,8 @@ export function RatesPanel() {
   const fiatValue = Number(amount) || 0;
 
   return (
-    <section>
-      <h2>Tasas</h2>
+    <section className="panel">
+      <h2>Precio de referencia</h2>
       <div>
         <label>
           Fiat{" "}

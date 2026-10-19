@@ -7,13 +7,15 @@ import type { NostrClient } from "../lib/nostr";
 interface Props {
   client: NostrClient;
   identity: Identity | null;
+  initialType?: OrderType;
   onPublished?: () => void;
+  onCancel?: () => void;
 }
 
 type Mode = "fiat" | "sats";
 
-export function OrderForm({ client, identity, onPublished }: Props) {
-  const [type, setType] = useState<OrderType>("sell");
+export function OrderForm({ client, identity, initialType = "sell", onPublished, onCancel }: Props) {
+  const [type, setType] = useState<OrderType>(initialType);
   const [fiat, setFiat] = useState("CUP");
   const [mode, setMode] = useState<Mode>("fiat");
   const [amount, setAmount] = useState("1000");
@@ -85,97 +87,124 @@ export function OrderForm({ client, identity, onPublished }: Props) {
   }
 
   return (
-    <section>
-      <h2>Nueva orden</h2>
-      <div>
-        <label>
-          Tipo{" "}
-          <select value={type} onChange={(e) => setType(e.target.value as OrderType)}>
-            <option value="sell">vender BTC</option>
-            <option value="buy">comprar BTC</option>
-          </select>
-        </label>{" "}
-        <label>
-          Fiat{" "}
-          <input value={fiat} onChange={(e) => setFiat(e.target.value)} style={{ width: 80 }} />
-        </label>{" "}
-        <label>
-          Prima %{" "}
-          <input
-            value={premium}
-            onChange={(e) => setPremium(e.target.value)}
-            style={{ width: 60 }}
-          />
-        </label>
+    <section className="panel">
+      <div className="segmented" role="tablist" aria-label="Lado de la oferta">
+        <button
+          type="button"
+          role="tab"
+          data-side="buy"
+          data-active={type === "buy"}
+          aria-selected={type === "buy"}
+          onClick={() => setType("buy")}
+        >
+          Comprar BTC
+        </button>
+        <button
+          type="button"
+          role="tab"
+          data-side="sell"
+          data-active={type === "sell"}
+          aria-selected={type === "sell"}
+          onClick={() => setType("sell")}
+        >
+          Vender BTC
+        </button>
       </div>
 
-      <div>
-        <label>
-          Medir por{" "}
-          <select value={mode} onChange={(e) => setMode(e.target.value as Mode)}>
+      <p className="panel-note">
+        {type === "buy"
+          ? "Publicas una oferta de compra: la contraparte te venderá BTC y tú pagas en fiat."
+          : "Publicas una oferta de venta: la contraparte te comprará BTC y tú recibes fiat."}
+      </p>
+
+      <div className="form-grid">
+        <label className="field">
+          <span>Fiat</span>
+          <input className="input" value={fiat} onChange={(e) => setFiat(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>Prima %</span>
+          <input
+            className="input"
+            inputMode="decimal"
+            value={premium}
+            onChange={(e) => setPremium(e.target.value)}
+          />
+        </label>
+        <label className="field">
+          <span>Medir por</span>
+          <select className="input" value={mode} onChange={(e) => setMode(e.target.value as Mode)}>
             <option value="fiat">monto fiat</option>
             <option value="sats">monto en sats</option>
           </select>
-        </label>{" "}
-        <label>
-          Monto{" "}
-          <input value={amount} onChange={(e) => setAmount(e.target.value)} style={{ width: 120 }} />
-        </label>{" "}
-        <label>
-          Expira en horas{" "}
+        </label>
+        <label className="field">
+          <span>Monto</span>
           <input
+            className="input"
+            inputMode="decimal"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+          />
+        </label>
+        <label className="field">
+          <span>Expira en horas</span>
+          <input
+            className="input"
+            inputMode="numeric"
             value={expiryHours}
             onChange={(e) => setExpiryHours(e.target.value)}
-            style={{ width: 60 }}
           />
         </label>
       </div>
 
-      <div>
-        <label style={{ display: "block" }}>
-          Métodos de pago (separados por coma)
-          <input
-            value={methods}
-            onChange={(e) => setMethods(e.target.value)}
-            style={{ width: "100%" }}
-          />
-        </label>
-      </div>
+      <label className="field">
+        <span>Métodos de pago (separados por coma)</span>
+        <input className="input" value={methods} onChange={(e) => setMethods(e.target.value)} />
+      </label>
 
       {type === "sell" && (
-        <div>
-          <label style={{ display: "block" }}>
-            Tu dirección Ark de reembolso (recibe los sats si se cancela/disputa)
-            <input
-              value={arkRefund}
-              onChange={(e) => setArkRefund(e.target.value)}
-              placeholder="ark1..."
-              style={{ width: "100%" }}
-            />
-          </label>
-        </div>
+        <label className="field">
+          <span>Tu dirección Ark de reembolso (recibe los sats si se cancela o disputa)</span>
+          <input
+            className="input"
+            value={arkRefund}
+            onChange={(e) => setArkRefund(e.target.value)}
+            placeholder="ark1..."
+          />
+        </label>
       )}
 
       {type === "buy" && (
-        <div>
-          <label style={{ display: "block" }}>
-            Tu dirección Ark donde recibirás los sats que compras
-            <input
-              value={arkReceive}
-              onChange={(e) => setArkReceive(e.target.value)}
-              placeholder="ark1..."
-              style={{ width: "100%" }}
-            />
-          </label>
-        </div>
+        <label className="field">
+          <span>Tu dirección Ark donde recibirás los sats que compras</span>
+          <input
+            className="input"
+            value={arkReceive}
+            onChange={(e) => setArkReceive(e.target.value)}
+            placeholder="ark1..."
+          />
+        </label>
       )}
 
-      <button type="button" disabled={busy} onClick={submit}>
-        {busy ? "Publicando..." : "Publicar orden"}
-      </button>
+      <div className="form-actions">
+        <button
+          type="button"
+          className="btn btn-primary"
+          disabled={busy}
+          onClick={() => void submit()}
+        >
+          {busy ? "Publicando…" : "Publicar oferta"}
+        </button>
+        {onCancel && (
+          <button type="button" className="btn btn-ghost" onClick={onCancel}>
+            Cancelar
+          </button>
+        )}
+      </div>
 
-      {status && <p style={{ color: "green" }}>{status}</p>}
-      {error && <p style={{ color: "crimson" }}>{error}</p>}
+      {status && <p className="notice">{status}</p>}
+      {error && <p className="alert">Error: {error}</p>}
     </section>
   );
 }

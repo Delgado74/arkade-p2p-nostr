@@ -12,6 +12,9 @@ interface Props {
   refreshSignal?: number;
 }
 
+/** The side the taker plays: buying lists sell orders and vice versa. */
+type Side = "buy" | "sell";
+
 function shortNpub(pubkey: string): string {
   try {
     return `${nip19.npubEncode(pubkey).slice(0, 14)}…`;
@@ -20,13 +23,18 @@ function shortNpub(pubkey: string): string {
   }
 }
 
-/** The taker takes the opposite side of the maker's order. */
-function takerIsBuyer(order: Order): boolean {
-  return order.type === "sell";
-}
-
 function orderKey(order: Order): string {
   return `${order.maker}:${order.id}`;
+}
+
+/** Which maker orders the given taker side should see. */
+function orderTypeForSide(side: Side): OrderType {
+  return side === "buy" ? "sell" : "buy";
+}
+
+function expiryLabel(order: Order): string {
+  if (!order.expiresAt) return "sin caducidad";
+  return `expira ${new Date(order.expiresAt * 1000).toLocaleString()}`;
 }
 
 /**
@@ -45,7 +53,7 @@ function mergeOrder(prev: Order[], order: Order, now: number): Order[] {
 }
 
 export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
-  const [type, setType] = useState<OrderType>("sell");
+  const [side, setSide] = useState<Side>("buy");
   const [orders, setOrders] = useState<Order[]>([]);
   const [takingKey, setTakingKey] = useState<string | null>(null);
   const [arkInput, setArkInput] = useState("");
@@ -56,11 +64,17 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
   // cannot resurrect an order that has since been taken or deleted.
   const latestRef = useRef<Map<string, number>>(new Map());
 
-  function selectType(next: OrderType) {
-    if (next === type) return;
+  const orderType = orderTypeForSide(side);
+
+  function selectSide(next: Side) {
+    if (next === side) return;
     latestRef.current.clear();
     setOrders([]);
-    setType(next);
+    setLoaded(false);
+    setError("");
+    setTakingKey(null);
+    setArkInput("");
+    setSide(next);
   }
 
   // Initial load plus a live subscription: new orders appear without reloading
@@ -78,7 +92,7 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
 
     client
       .fetchOrders({
-        type,
+        type: orderType,
         status: "pending",
         layer: "arkade",
         limit: 100,
@@ -94,7 +108,7 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
       });
 
     const subscription = client.subscribeOrders(
-      { type },
+      { type: orderType },
       {
         onOrder: (order) => {
           if (!cancelled) ingest(order);
@@ -106,7 +120,7 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
       cancelled = true;
       subscription.close();
     };
-  }, [client, type, refreshSignal]);
+  }, [client, orderType, refreshSignal]);
 
   function hideOrder(order: Order) {
     setOrders((prev) => prev.filter((o) => orderKey(o) !== orderKey(order)));
@@ -140,7 +154,7 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
   }
 
   function confirmTake(order: Order) {
-    if (takerIsBuyer(order)) {
+    if (side === "buy") {
       const address = arkInput.trim();
       if (!address) {
         setError("Indica la dirección Ark donde recibirás los fondos.");
@@ -155,106 +169,134 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
   }
 
   return (
-    <section>
-      <h2>Libro de órdenes</h2>
-      <div style={{ display: "flex", gap: 8 }}>
+    <section className="book">
+      <div className="segmented" role="tablist" aria-label="Lado de la orden">
         <button
           type="button"
-          onClick={() => selectType("sell")}
-          style={{ fontWeight: type === "sell" ? "bold" : "normal" }}
+          role="tab"
+          data-side="buy"
+          data-active={side === "buy"}
+          aria-selected={side === "buy"}
+          onClick={() => selectSide("buy")}
         >
-          Venta
+          Comprar BTC
         </button>
         <button
           type="button"
-          onClick={() => selectType("buy")}
-          style={{ fontWeight: type === "buy" ? "bold" : "normal" }}
+          role="tab"
+          data-side="sell"
+          data-active={side === "sell"}
+          aria-selected={side === "sell"}
+          onClick={() => selectSide("sell")}
         >
-          Compra
+          Vender BTC
         </button>
       </div>
 
-      <p style={{ fontSize: "0.85em" }}>
-        Solo órdenes en Arkade · muestran todas las monedas fiat
+      <p className="book-hint">
+        {side === "buy"
+          ? "Ofertas de venta: al tomarlas compras BTC y pagas en fiat."
+          : "Ofertas de compra: al tomarlas vendes BTC y recibes fiat."}
       </p>
 
-      <p style={{ fontSize: "0.85em" }}>Relays: {client.relays.join(", ")}</p>
+      {error && <p className="alert">Error: {error}</p>}
+      {loaded && orders.length === 0 && !error && (
+        <p className="empty">Sin órdenes {side === "buy" ? "de venta" : "de compra"} ahora mismo.</p>
+      )}
 
-      {error && <p style={{ color: "crimson" }}>{error}</p>}
-      {loaded && orders.length === 0 && !error && <p>Sin órdenes.</p>}
-
-      <ul style={{ listStyle: "none", padding: 0 }}>
+      <div className="order-grid">
         {orders.map((order) => {
           const key = orderKey(order);
           const isOwn = order.maker === identity?.pubkeyHex;
-          const buyerTakes = takerIsBuyer(order);
+          const buyerTakes = side === "buy";
           return (
-            <li
-              key={key}
-              style={{ border: "1px solid #8884", borderRadius: 8, padding: 12, marginBottom: 8 }}
-            >
-              <strong style={{ textTransform: "uppercase" }}>{order.type}</strong>{" "}
-              {order.amountSats > 0 ? `${order.amountSats.toLocaleString()} sats` : "mercado"}{" "}
-              · {order.fiatAmount} {order.fiat} · prima {order.premium}%
-              <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
-                {order.platform} · {order.layer}/{order.network} · {order.paymentMethods.join(", ")}
+            <article className="order-card" key={key}>
+              <div className="order-card-head">
+                <div>
+                  <div className="order-amount">
+                    {order.amountSats > 0 ? `${order.amountSats.toLocaleString()} sats` : "Mercado"}
+                  </div>
+                  <div className="order-price">
+                    {order.fiatAmount} {order.fiat}
+                    <span className="order-premium">prima {order.premium}%</span>
+                  </div>
+                </div>
+                <span className="order-tag" data-side={order.type}>
+                  {order.type === "sell" ? "En venta" : "En compra"}
+                </span>
               </div>
-              <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
-                maker {shortNpub(order.maker)}
-                {order.expiresAt
-                  ? ` · expira ${new Date(order.expiresAt * 1000).toLocaleString()}`
-                  : ""}
-                {isExpired(order) ? " · EXPIRADA" : ""}
+
+              <div className="order-tags">
+                {order.paymentMethods.map((method) => (
+                  <span className="tag" key={method}>
+                    {method}
+                  </span>
+                ))}
+              </div>
+
+              <div className="order-foot">
+                <span>maker {shortNpub(order.maker)}</span>
+                <span>{expiryLabel(order)}</span>
               </div>
 
               {isOwn && order.status === "pending" && (
-                <div style={{ marginTop: 6 }}>
-                  <button type="button" disabled={busy} onClick={() => handleDelete(order)}>
+                <div className="order-actions">
+                  <button
+                    type="button"
+                    className="btn btn-ghost-danger"
+                    disabled={busy}
+                    onClick={() => void handleDelete(order)}
+                  >
                     Eliminar mi orden
                   </button>
                 </div>
               )}
 
-              {onTake && !isOwn && !isExpired(order) && (
-                <div style={{ marginTop: 6 }}>
+              {onTake && !isOwn && (
+                <div className="order-actions">
                   {!buyerTakes && (
-                    <button type="button" onClick={() => confirmTake(order)}>
-                      Tomar (vender BTC)
+                    <button type="button" className="btn btn-sell" onClick={() => confirmTake(order)}>
+                      Vender BTC
                     </button>
                   )}
                   {buyerTakes && takingKey !== key && (
-                    <button type="button" onClick={() => setTakingKey(key)}>
-                      Tomar
+                    <button type="button" className="btn btn-buy" onClick={() => setTakingKey(key)}>
+                      Comprar BTC
                     </button>
                   )}
                   {buyerTakes && takingKey === key && (
-                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                    <div className="take-form">
                       <input
+                        className="input"
                         placeholder="tu dirección Ark para recibir los sats"
                         value={arkInput}
                         onChange={(e) => setArkInput(e.target.value)}
-                        style={{ width: 340 }}
                       />
-                      <button type="button" onClick={() => confirmTake(order)}>
-                        Confirmar toma
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setTakingKey(null);
-                          setArkInput("");
-                        }}
-                      >
-                        Cancelar
-                      </button>
+                      <div className="take-actions">
+                        <button type="button" className="btn btn-buy" onClick={() => confirmTake(order)}>
+                          Confirmar
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          onClick={() => {
+                            setTakingKey(null);
+                            setArkInput("");
+                          }}
+                        >
+                          Cancelar
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
               )}
-            </li>
+            </article>
           );
         })}
-      </ul>
+      </div>
+
+      <p className="book-relays">Relays: {client.relays.join(", ")}</p>
     </section>
   );
 }

@@ -50,7 +50,7 @@ export function EscrowHarness({ identity, ctx }: Props) {
   }
 
   return (
-    <section>
+    <section className="panel">
       <h2>Escrow (vista de desarrollo)</h2>
       <p style={{ fontSize: "0.85em" }}>
         Compone el VtxoScript de 2 hojas (release + árbitro), muestra direcciones y verifica

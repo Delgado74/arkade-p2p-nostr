@@ -21,14 +21,13 @@ import { isFinished, statusLabel, type OperationRecord } from "../lib/operations
 import {
   buildConversations,
   buildDisputeRooms,
-  loadReadMarks,
   peerOf,
   previewOf,
-  saveReadMarks,
   timeLabel,
   type ChatMessage,
   type Conversation,
   type DisputeRoom,
+  type ReadMarks,
 } from "../lib/chat";
 
 interface Props {
@@ -39,6 +38,8 @@ interface Props {
   disputeTakes: DisputeTake[];
   disputeResolutions: DisputeResolution[];
   operations: OperationRecord[];
+  readMarks: ReadMarks;
+  onReadMarksChange: (marks: ReadMarks) => void;
 }
 
 type Segment = "mensajes" | "disputas";
@@ -144,13 +145,14 @@ export function ChatPanel({
   disputeTakes,
   disputeResolutions,
   operations,
+  readMarks,
+  onReadMarksChange,
 }: Props) {
   const [segment, setSegment] = useState<Segment>("mensajes");
   const [openRoom, setOpenRoom] = useState<OpenRoom>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [readMarks, setReadMarks] = useState(() => loadReadMarks(identity.pubkeyHex));
 
   const conversations = useMemo(
     () => buildConversations(feed, identity.pubkeyHex, readMarks),
@@ -192,9 +194,7 @@ export function ChatPanel({
     if (!last) return;
     const current = readMarks[key] ?? 0;
     if (last.ts <= current) return;
-    const next = { ...readMarks, [key]: last.ts };
-    setReadMarks(next);
-    saveReadMarks(identity.pubkeyHex, next);
+    onReadMarksChange({ ...readMarks, [key]: last.ts });
   }
 
   function openChat(conv: Conversation) {
@@ -392,8 +392,6 @@ export function ChatPanel({
 
   return (
     <section className="chat">
-      <h2>Chat</h2>
-
       <div className="chat-segments">
         <button
           type="button"

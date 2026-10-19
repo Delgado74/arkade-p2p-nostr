@@ -1,65 +1,10 @@
 /* Chat screen (Mostro-style): segments, conversation cards, dispute rooms. */
 
 .chat {
-  --bg: #f4f6f4;
-  --surface: #ffffff;
-  --border: rgba(18, 22, 31, 0.08);
-  --divider: rgba(18, 22, 31, 0.07);
-  --text-primary: #12161f;
-  --text-secondary: #5a6474;
-  --text-tertiary: #5f6979;
-  --text-faint: #636d7d;
-  --group-header: #5f6979;
-  --lime: #92d64f;
-  --lime-ink: #3e6b1c;
-  --badge-bg: #92d64f;
-  --badge-ink: #12161f;
-  --chip-dispute-bg: rgba(229, 72, 77, 0.12);
-  --chip-dispute-border: rgba(229, 72, 77, 0.35);
-  --chip-dispute-ink: #a8262b;
-  --seg-idle-bg: #ffffff;
-  --seg-idle-border: rgba(18, 22, 31, 0.09);
-  --seg-active-bg: rgba(146, 214, 79, 0.2);
-  --seg-active-border: rgba(92, 145, 48, 0.4);
-  --seg-active-ink: #3e6b1c;
-  --avatar-bg: rgba(146, 214, 79, 0.2);
-  --avatar-dispute-bg: rgba(229, 72, 77, 0.12);
-  --bubble-own: #92d64f;
-  --bubble-own-ink: #12161f;
-  --bubble-peer: #ffffff;
-  --bubble-peer-ink: #2a303c;
-  --closed-opacity: 0.72;
-
   display: flex;
   flex-direction: column;
   gap: 14px;
   color: var(--text-secondary);
-}
-
-@media (prefers-color-scheme: dark) {
-  .chat {
-    --bg: #12161f;
-    --surface: #1a2030;
-    --border: rgba(255, 255, 255, 0.07);
-    --divider: rgba(255, 255, 255, 0.05);
-    --text-primary: #eef1f6;
-    --text-secondary: #8b97ad;
-    --text-tertiary: #7e899e;
-    --text-faint: #808a9e;
-    --group-header: #828ca0;
-    --lime-ink: #c6f09a;
-    --chip-dispute-bg: rgba(255, 139, 139, 0.12);
-    --chip-dispute-border: rgba(255, 139, 139, 0.28);
-    --chip-dispute-ink: #ff8b8b;
-    --seg-idle-bg: rgba(255, 255, 255, 0.04);
-    --seg-idle-border: rgba(255, 255, 255, 0.07);
-    --seg-active-bg: rgba(146, 214, 79, 0.14);
-    --seg-active-border: rgba(146, 214, 79, 0.3);
-    --avatar-bg: rgba(146, 214, 79, 0.14);
-    --avatar-dispute-bg: rgba(255, 139, 139, 0.12);
-    --bubble-peer: #1a2030;
-    --bubble-peer-ink: #d6dce8;
-  }
 }
 
 .chat-segments {

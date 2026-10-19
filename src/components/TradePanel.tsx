@@ -727,8 +727,8 @@ export function TradePanel({
   const authSellerAddr = isSolver && disputeMsg ? authenticatedAddress("seller") : null;
 
   return (
-    <section>
-      <h2>Operación (Fase 4 · DMs NIP-17)</h2>
+    <section className="panel">
+      <h2>Detalle de la operación</h2>
       <p style={{ fontSize: "0.85em" }}>
         Acuerdo de escrow, métodos de pago, firma cooperativa y disputa/arbitraje por mensajes
         privados cifrados (NIP-17). Todo en mutinynet, fondos de prueba.
