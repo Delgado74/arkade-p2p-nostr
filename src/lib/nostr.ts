@@ -10,9 +10,18 @@ import {
   type OrderType,
 } from "./protocol";
 import {
+  DISPUTE_KIND,
+  DISPUTE_TAKE_KIND,
+  DISPUTE_RESOLUTION_KIND,
   SOLVERS_KIND,
   parseSolverRegistry,
+  parseDisputeAnnounce,
+  parseDisputeTake,
+  parseDisputeResolution,
   type SolverRegistry,
+  type DisputeAnnounce,
+  type DisputeTake,
+  type DisputeResolution,
 } from "./protocol";
 import type { Identity } from "./identity";
 
@@ -273,6 +282,63 @@ export class NostrClient {
       onevent: (event: Event) => {
         const reg = parseSolverRegistry(event);
         if (reg) handlers.onRegistry(reg);
+      },
+      oneose: handlers.onEose,
+    });
+    return { close: () => subscription.close() };
+  }
+
+  /** Subscribe to dispute announcements (38386) for a given order or globally. */
+  subscribeDisputes(
+    handlers: { onDispute: (d: DisputeAnnounce) => void; onEose?: () => void },
+    opts?: { orderId?: string },
+  ): OrderSubscription {
+    const nostrFilter: Filter = { kinds: [DISPUTE_KIND] };
+    if (opts?.orderId) nostrFilter["#d"] = [opts.orderId];
+    const subscription = this.pool.subscribeMany(this.relays, nostrFilter, {
+      onevent: (event: Event) => {
+        const d = parseDisputeAnnounce(event);
+        if (d) handlers.onDispute(d);
+      },
+      oneose: handlers.onEose,
+    });
+    return { close: () => subscription.close() };
+  }
+
+  /** Subscribe to dispute takes (38387). */
+  subscribeDisputeTakes(
+    handlers: { onTake: (t: DisputeTake) => void; onEose?: () => void },
+    opts?: { orderId?: string },
+  ): OrderSubscription {
+    const nostrFilter: Filter = { kinds: [DISPUTE_TAKE_KIND] };
+    if (opts?.orderId) {
+      nostrFilter["#d"] = [opts.orderId];
+      nostrFilter["#e"] = [opts.orderId];
+    }
+    const subscription = this.pool.subscribeMany(this.relays, nostrFilter, {
+      onevent: (event: Event) => {
+        const t = parseDisputeTake(event);
+        if (t) handlers.onTake(t);
+      },
+      oneose: handlers.onEose,
+    });
+    return { close: () => subscription.close() };
+  }
+
+  /** Subscribe to dispute resolutions (38388). */
+  subscribeDisputeResolutions(
+    handlers: { onRes: (r: DisputeResolution) => void; onEose?: () => void },
+    opts?: { orderId?: string },
+  ): OrderSubscription {
+    const nostrFilter: Filter = { kinds: [DISPUTE_RESOLUTION_KIND] };
+    if (opts?.orderId) {
+      nostrFilter["#d"] = [opts.orderId];
+      nostrFilter["#e"] = [opts.orderId];
+    }
+    const subscription = this.pool.subscribeMany(this.relays, nostrFilter, {
+      onevent: (event: Event) => {
+        const r = parseDisputeResolution(event);
+        if (r) handlers.onRes(r);
       },
       oneose: handlers.onEose,
     });

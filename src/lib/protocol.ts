@@ -201,7 +201,7 @@ export const SOLVERS_KIND = 38389;
 export interface SolverRegistry {
   id: string;
   pubkey: string;
-  solvers: string[]; // npubs or hex? we store hex pubkeys
+  solvers: string[]; // hex pubkeys
   createdAt: number;
   event: Event;
 }
@@ -218,6 +218,94 @@ export function parseSolverRegistry(event: Event): SolverRegistry | null {
     id: d,
     pubkey: event.pubkey,
     solvers,
+    createdAt: event.created_at,
+    event,
+  };
+}
+
+export type DisputeStatus = "initiated" | "in-progress" | "settled" | "refunded" | "canceled";
+
+export interface DisputeAnnounce {
+  id: string; // d = orderId
+  pubkey: string;
+  orderId: string;
+  status: DisputeStatus;
+  initiator: string; // hex pubkey
+  reason?: string;
+  createdAt: number;
+  event: Event;
+}
+
+export function parseDisputeAnnounce(event: Event): DisputeAnnounce | null {
+  if (event.kind !== DISPUTE_KIND) return null;
+  const d = tag(event, "d");
+  const status = tag(event, "s");
+  const initiator = tag(event, "initiator");
+  if (!d || !status || !initiator) return null;
+  return {
+    id: d,
+    pubkey: event.pubkey,
+    orderId: d,
+    status: status as DisputeStatus,
+    initiator,
+    createdAt: event.created_at,
+    event,
+  };
+}
+
+export interface DisputeTake {
+  id: string;
+  pubkey: string;
+  orderId: string;
+  solverPubKey: string; // hex
+  createdAt: number;
+  event: Event;
+}
+
+export function parseDisputeTake(event: Event): DisputeTake | null {
+  if (event.kind !== DISPUTE_TAKE_KIND) return null;
+  const d = tag(event, "d");
+  const solver = tag(event, "solver");
+  const e = event.tags.find((t) => t[0] === "e")?.[1];
+  const orderId = d || e;
+  if (!orderId || !solver) return null;
+  return {
+    id: orderId,
+    pubkey: event.pubkey,
+    orderId,
+    solverPubKey: solver,
+    createdAt: event.created_at,
+    event,
+  };
+}
+
+export interface DisputeResolution {
+  id: string;
+  pubkey: string;
+  orderId: string;
+  status: DisputeStatus;
+  solverPubKey: string;
+  arkTxid?: string;
+  createdAt: number;
+  event: Event;
+}
+
+export function parseDisputeResolution(event: Event): DisputeResolution | null {
+  if (event.kind !== DISPUTE_RESOLUTION_KIND) return null;
+  const d = tag(event, "d");
+  const e = event.tags.find((t) => t[0] === "e")?.[1];
+  const status = tag(event, "s");
+  const solver = tag(event, "solver");
+  const ark = tag(event, "ark_txid");
+  const orderId = d || e;
+  if (!orderId || !status || !solver) return null;
+  return {
+    id: orderId,
+    pubkey: event.pubkey,
+    orderId,
+    status: status as DisputeStatus,
+    solverPubKey: solver,
+    arkTxid: ark,
     createdAt: event.created_at,
     event,
   };
