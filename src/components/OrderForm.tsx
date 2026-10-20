@@ -23,7 +23,6 @@ export function OrderForm({ client, identity, initialType = "sell", onPublished,
   const [methods, setMethods] = useState("Transfermóvil, Efectivo");
   const [arkRefund, setArkRefund] = useState("");
   const [arkReceive, setArkReceive] = useState("");
-  const [expiryHours, setExpiryHours] = useState("24");
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -66,7 +65,7 @@ export function OrderForm({ client, identity, initialType = "sell", onPublished,
         amountSats,
         premium: Number(premium) || 0,
         paymentMethods: methods.split(",").map((m) => m.trim()).filter(Boolean),
-        expiresAt: Math.floor(Date.now() / 1000) + (Number(expiryHours) || 24) * 3600,
+        expiresAt: Math.floor(Date.now() / 1000) + 24 * 3600,
         name: identity.npub,
         arkRefundAddress: arkRefund.trim() || undefined,
         arkReceiveAddress: arkReceive.trim() || undefined,
@@ -147,15 +146,7 @@ export function OrderForm({ client, identity, initialType = "sell", onPublished,
             onChange={(e) => setAmount(e.target.value)}
           />
         </label>
-        <label className="field">
-          <span>Expira en horas</span>
-          <input
-            className="input"
-            inputMode="numeric"
-            value={expiryHours}
-            onChange={(e) => setExpiryHours(e.target.value)}
-          />
-        </label>
+        <p className="panel-note">Publicación de orden expira en 24 horas.</p>
       </div>
 
       <label className="field">
