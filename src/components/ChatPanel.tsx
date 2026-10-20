@@ -29,6 +29,7 @@ import {
   type DisputeRoom,
   type ReadMarks,
 } from "../lib/chat";
+import type { PeerLabel } from "../lib/useNyms";
 
 interface Props {
   identity: Identity;
@@ -40,6 +41,7 @@ interface Props {
   operations: OperationRecord[];
   readMarks: ReadMarks;
   onReadMarksChange: (marks: ReadMarks) => void;
+  label?: PeerLabel;
 }
 
 type Segment = "mensajes" | "disputas";
@@ -47,6 +49,20 @@ type OpenRoom = { segment: Segment; key: string } | null;
 
 function shortKey(key: string): string {
   return key ? `${key.slice(0, 12)}…` : "—";
+}
+
+/**
+ * Status line of a dispute room. Takes a `peer` reader so solver/initiator
+ * keys show as their local pseudonym instead of a raw prefix.
+ */
+function disputeStatusLine(room: DisputeRoom, peer: (key: string) => string): string {
+  if (room.status === "settled") return "resuelta · pagada al comprador";
+  if (room.status === "refunded") return "resuelta · reembolsada al vendedor";
+  if (room.status === "canceled") return "cancelada";
+  if (room.status === "in-progress") {
+    return room.winner ? `en curso · solver ${peer(room.winner)}` : "en curso";
+  }
+  return room.reason ? `abierta · ${room.reason}` : "abierta";
 }
 
 function nowSeconds(): number {
@@ -79,16 +95,6 @@ function conversationContext(conv: Conversation, operations: OperationRecord[]):
   }
   if (conv.orderId) return `orden ${conv.orderId.slice(0, 10)}…`;
   return "mensaje directo";
-}
-
-function disputeStatusLine(room: DisputeRoom): string {
-  if (room.status === "settled") return "resuelta · pagada al comprador";
-  if (room.status === "refunded") return "resuelta · reembolsada al vendedor";
-  if (room.status === "canceled") return "cancelada";
-  if (room.status === "in-progress") {
-    return room.winner ? `en curso · solver ${shortKey(room.winner)}` : "en curso";
-  }
-  return room.reason ? `abierta · ${room.reason}` : "abierta";
 }
 
 /** Every peer we have exchanged order DMs with, minus ourselves. */
@@ -147,12 +153,15 @@ export function ChatPanel({
   operations,
   readMarks,
   onReadMarksChange,
+  label,
 }: Props) {
   const [segment, setSegment] = useState<Segment>("mensajes");
   const [openRoom, setOpenRoom] = useState<OpenRoom>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
+  const peer = (key: string) => label?.(key, shortKey(key)) ?? shortKey(key);
 
   const conversations = useMemo(
     () => buildConversations(feed, identity.pubkeyHex, readMarks),
@@ -283,10 +292,10 @@ export function ChatPanel({
         data-closed={closed}
         onClick={() => openChat(conv)}
       >
-        <span className="chat-avatar">{conv.peer.slice(0, 2).toUpperCase()}</span>
+        <span className="chat-avatar">{peer(conv.peer).slice(0, 2).toUpperCase()}</span>
         <span className="chat-row-main">
           <span className="chat-row-top">
-            <span className="chat-row-title">{shortKey(conv.peer)}</span>
+            <span className="chat-row-title">{peer(conv.peer)}</span>
             <span className="chat-row-time">
               {preview ? timeLabel(conv.messages[conv.messages.length - 1].ts) : ""}
             </span>
@@ -325,8 +334,8 @@ export function ChatPanel({
             </span>
           </span>
           <span className="chat-row-context">
-            {disputeStatusLine(room)}
-            {room.initiator ? ` · ${byMe ? "abierta por ti" : `por ${shortKey(room.initiator)}`}` : ""}
+            {disputeStatusLine(room, peer)}
+            {room.initiator ? ` · ${byMe ? "abierta por ti" : `por ${peer(room.initiator)}`}` : ""}
           </span>
           <span className="chat-row-preview">
             <span>{preview?.text ?? ""}</span>
@@ -347,7 +356,7 @@ export function ChatPanel({
   function roomTitle(): { title: string; sub: string; chip: boolean } {
     if (openConv) {
       return {
-        title: shortKey(openConv.peer),
+        title: peer(openConv.peer),
         sub: conversationContext(openConv, operations),
         chip: false,
       };
@@ -355,7 +364,7 @@ export function ChatPanel({
     if (openDispute) {
       return {
         title: `Orden ${openDispute.orderId.slice(0, 10)}…`,
-        sub: disputeStatusLine(openDispute),
+        sub: disputeStatusLine(openDispute, peer),
         chip: openDispute.open,
       };
     }

@@ -40,6 +40,7 @@ import { TradePanel, type TradeRequest } from "./components/TradePanel";
 import { ChatPanel } from "./components/ChatPanel";
 import { SolverInbox } from "./components/SolverInbox";
 import { activeSolverDisputes, buildSolverDisputes, isListedSolver } from "./lib/solver";
+import { usePeerLabels } from "./lib/useNyms";
 import { Sidebar } from "./components/Sidebar";
 import { BottomNav } from "./components/BottomNav";
 import { AddOrderButton } from "./components/AddOrderButton";
@@ -297,6 +298,22 @@ export default function App() {
   );
   const solverActive = activeSolverDisputes(solverDisputes);
 
+  // Every pubkey the UI may render, so their deterministic pseudonyms can be
+  // derived locally and shown instead of raw keys.
+  const peerKeys = useMemo(() => {
+    const keys: string[] = [];
+    for (const entry of feed) {
+      keys.push(entry.dm.sender, ...entry.dm.recipients);
+    }
+    for (const d of disputeAnnounces) keys.push(d.initiator);
+    for (const t of disputeTakes) keys.push(t.solverPubKey);
+    for (const r of disputeResolutions) keys.push(r.solverPubKey);
+    for (const op of operations) keys.push(op.counterparty);
+    if (solverRegistry) keys.push(...solverRegistry.solvers);
+    return keys;
+  }, [feed, disputeAnnounces, disputeTakes, disputeResolutions, operations, solverRegistry]);
+  const label = usePeerLabels(peerKeys);
+
   function navigate(screen: Screen) {
     setSidebarOpen(false);
     setTab(screen);
@@ -511,7 +528,7 @@ export default function App() {
           )}
 
           {screen === "trades" && (
-            <OperationsPanel operations={operations} onOpen={openOperation} />
+            <OperationsPanel operations={operations} onOpen={openOperation} label={label} />
           )}
 
           {screen === "trade" &&
@@ -545,12 +562,13 @@ export default function App() {
                 feed={feed}
                 disputeAnnounces={disputeAnnounces}
                 disputeTakes={disputeTakes}
+                label={label}
               />
             ))}
 
           {screen === "disputes" &&
             (isSolver ? (
-              <SolverInbox disputes={solverDisputes} onOpen={openSolverDispute} />
+              <SolverInbox disputes={solverDisputes} onOpen={openSolverDispute} label={label} />
             ) : (
               <p className="empty">Esta clave no figura como solver de esta comunidad.</p>
             ))}
@@ -566,6 +584,7 @@ export default function App() {
               operations={operations}
               readMarks={readMarks}
               onReadMarksChange={applyReadMarks}
+              label={label}
             />
           )}
 

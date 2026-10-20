@@ -1,11 +1,13 @@
 import { isFinished, statusLabel, type OperationRecord } from "../lib/operations";
+import type { PeerLabel } from "../lib/useNyms";
 
 interface Props {
   operations: OperationRecord[];
   onOpen?: (orderId: string) => void;
+  label?: PeerLabel;
 }
 
-function shortPubkey(pubkey: string): string {
+function fallbackLabel(pubkey: string): string {
   return pubkey ? `${pubkey.slice(0, 12)}…` : "—";
 }
 
@@ -14,7 +16,8 @@ function timestamp(seconds: number): string {
 }
 
 /** Active and finished trades of the local identity. */
-export function OperationsPanel({ operations, onOpen }: Props) {
+export function OperationsPanel({ operations, onOpen, label }: Props) {
+  const peer = (pubkey: string) => label?.(pubkey, fallbackLabel(pubkey)) ?? fallbackLabel(pubkey);
   const active = operations.filter((op) => !isFinished(op.status));
   const closed = operations.filter((op) => isFinished(op.status));
 
@@ -40,7 +43,7 @@ export function OperationsPanel({ operations, onOpen }: Props) {
           </span>
         </div>
         <div className="op-meta">
-          contraparte {shortPubkey(op.counterparty)} · orden {op.orderId.slice(0, 8)}…
+          contraparte {peer(op.counterparty)} · orden {op.orderId.slice(0, 8)}…
         </div>
         {!finished && onOpen && (
           <div className="op-actions">

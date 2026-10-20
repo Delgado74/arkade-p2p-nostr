@@ -6,6 +6,7 @@ import type { ArkContext } from "../lib/arkade";
 import { pubkeyFromInput, type Identity } from "../lib/identity";
 import { arbiterPubKey, coordinatorPubKey } from "../lib/config";
 import type { NostrClient } from "../lib/nostr";
+import type { PeerLabel } from "../lib/useNyms";
 import {
   assertFunded,
   buildEscrow,
@@ -70,6 +71,8 @@ interface Props {
   disputeAnnounces?: DisputeAnnounce[];
   /** Public dispute takes (kind 38387), including competing takes. */
   disputeTakes?: DisputeTake[];
+  /** Local pseudonym reader for pubkeys shown in the panel. */
+  label?: PeerLabel;
 }
 
 /**
@@ -116,10 +119,14 @@ export function TradePanel({
   feed,
   disputeAnnounces = [],
   disputeTakes = [],
+  label,
 }: Props) {
   const [role, setRole] = useState<TradeRole>(request?.role ?? "seller");
   const [orderId, setOrderId] = useState(request?.orderId ?? "");
   const [counterparty, setCounterparty] = useState(request?.counterparty ?? "");
+
+  const peer = (key: string) =>
+    label?.(key, key ? `${key.slice(0, 12)}…` : "—") ?? (key ? `${key.slice(0, 12)}…` : "—");
 
   const [tradeSats, setTradeSats] = useState(
     request?.tradeSats !== undefined ? String(request.tradeSats) : "",
@@ -797,14 +804,14 @@ export function TradePanel({
         )}
         {arbiter && (
           <span style={{ fontSize: "0.8em", opacity: 0.7 }}>
-            árbitro configurado: {arbiter.slice(0, 12)}…
+            árbitro configurado: {peer(arbiter)}…
           </span>
         )}
       </div>
 
       {activeTake && !counterparty.trim() && (
         <p style={{ fontSize: "0.85em", color: "#2563eb" }}>
-          Orden tomada por {activeTake.from.slice(0, 12)}… — order id y contraparte prellenados.
+          Orden tomada por {peer(activeTake.from)} — order id y contraparte prellenados.
           {activeTake.buyerArkAddress
             ? ` Comprador recibe en ${activeTake.buyerArkAddress.slice(0, 16)}…`
             : ""}
@@ -940,7 +947,7 @@ export function TradePanel({
       {isSolver && disputeMsg && (
         <div style={{ padding: 8, border: "1px solid #8884", borderRadius: 8 }}>
           <div>
-            <strong>Disputa</strong> de {disputeMsg.from.slice(0, 12)}…: {disputeMsg.payload.reason}
+            <strong>Disputa</strong> de {peer(disputeMsg.from)}: {disputeMsg.payload.reason}
           </div>
           <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
             {disputeMsg.payload.agreement.tradeSats.toLocaleString()} sats ·{" "}
@@ -950,7 +957,7 @@ export function TradePanel({
           <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
             anuncio público:{" "}
             {announceForOrder ? (
-              <span style={{ color: "#15803d" }}>visto (abierto por {announceForOrder.initiator.slice(0, 12)}…)</span>
+              <span style={{ color: "#15803d" }}>visto (abierto por {peer(announceForOrder.initiator)})</span>
             ) : (
               <span>esperando propagación…</span>
             )}
@@ -958,13 +965,13 @@ export function TradePanel({
           <div style={{ fontSize: "0.85em", margin: "4px 0" }}>
             {takenByOther && (
               <span style={{ color: "#b45309" }}>
-                Tomada por otro solver ({takeTaker?.solverPubKey.slice(0, 12)}…); tú puedes observar
+                Tomada por otro solver ({takeTaker ? peer(takeTaker.solverPubKey) : "—"}); tú puedes observar
                 pero no resolver.
               </span>
             )}
             {holdsTake && !takenByOther && (
               <span style={{ color: "#15803d", fontWeight: 700 }}>
-                La estás resolviendo tú ({identity?.pubkeyHex.slice(0, 12)}…).
+                La estás resolviendo tú ({identity ? peer(identity.pubkeyHex) : "—"}).
               </span>
             )}
           </div>
@@ -1161,7 +1168,7 @@ export function TradePanel({
         {relevant.map(({ dm, msg }) => (
           <li key={dm.id} style={{ color: dm.outgoing ? "#2563eb" : "inherit" }}>
             <small>
-              {dm.outgoing ? "→" : "←"} {dm.sender.slice(0, 10)}…{" "}
+              {dm.outgoing ? "→" : "←"} {peer(dm.sender)}{" "}
               {new Date(dm.createdAt * 1000).toLocaleTimeString()}
             </small>{" "}
             {msg ? summarize(msg) : <em>texto libre</em>}
