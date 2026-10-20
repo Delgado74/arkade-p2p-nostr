@@ -1,5 +1,6 @@
 import {
   ArkAddress,
+  CLTVMultisigTapscript,
   CSVMultisigTapscript,
   MultisigTapscript,
   Transaction,
@@ -27,16 +28,40 @@ import type { Identity } from "./identity";
  * Spending paths embedded in the escrow VTXO script.
  *
  * - `release`: buyer + seller + server (3-of-3) — cooperative settlement.
+ * - `refund`: seller + server (2-of-2) with an absolute timelock
+ *   (`refundLocktime`, a Unix-seconds CLTV value) — after maturity the seller
+ *   can reclaim the escrow without any solver. This is the on-chain protection
+ *   that mirrors Mostro's VHTLC refund: the buyer must release or open a dispute
+ *   before the timelock matures, otherwise the seller (with the server) can
+ *   refund alone.
  * - For each solver in the set, there is an `arbiter:<solver>` leaf:
  *   `solver + server` (2-of-2) — dispute resolution/refund through that solver.
- *   Ark VTXO scripts cannot contain absolute timelocks (CLTV), so a standalone
- *   refund path is not possible; every non-cooperative exit goes through some solver.
  */
 export const EscrowPath = {
   Release: "release",
+  Refund: "refund",
   Arbiter: "arbiter",
 } as const;
 export type EscrowPath = (typeof EscrowPath)[keyof typeof EscrowPath];
+
+/**
+ * Default escrow timelock *duration* (~24h), in seconds.
+ *
+ * `OP_CHECKLOCKTIMEVERIFY` operands are **absolute**: values below
+ * 500,000,000 are read as block heights, values at or above as Unix
+ * timestamps (BIP-113). Mutinynet's height is already in the millions, so a
+ * small block delta is unusable; we commit an absolute timestamp instead,
+ * fixed when the escrow is created and carried in the agreement.
+ */
+export const DEFAULT_REFUND_LOCKTIME_SECONDS = 24 * 60 * 60;
+
+/**
+ * Absolute CLTV timestamp (Unix seconds) for a refund that matures one default
+ * duration after `chainTimeSeconds` (the current chain median-time-past).
+ */
+export function refundLocktimeFrom(chainTimeSeconds: number): bigint {
+  return BigInt(Math.floor(chainTimeSeconds) + DEFAULT_REFUND_LOCKTIME_SECONDS);
+}
 
 export interface EscrowConfig {
   /** x-only (32-byte) or compressed (33-byte) buyer public key. */
@@ -50,6 +75,12 @@ export interface EscrowConfig {
   arbiterPubKeys: Uint8Array[];
   /** ASP server co-signer key (from `ArkInfo.signerPubkey`). */
   serverPubKey: Uint8Array;
+  /**
+   * Absolute CLTV timelock (Unix seconds, or a block height) after which the
+   * seller may reclaim the escrow through the `refund` leaf. Committed into the
+   * script, so both parties must agree on it. Defaults to ~24h after now.
+   */
+  refundLocktime?: bigint;
 }
 
 /** A solver leaf embedded in the escrow. */
@@ -61,14 +92,18 @@ export interface SolverLeaf {
 
 export interface Escrow {
   config: EscrowConfig;
-  /** The composed virtual output script (release + one leaf per solver). */
+  /** The composed virtual output script (release + refund + one leaf per solver). */
   script: VtxoScript;
   /** Arkade bech32m address to fund the escrow (off-chain). */
   address: string;
   /** Taproot on-chain address (unilateral exit / boarding). */
   onchainAddress: string;
+  /** Absolute CLTV timelock (Unix seconds) of the `refund` leaf. */
+  refundLocktime: bigint;
   releaseScript: Uint8Array;
   releaseLeaf: TapLeafScript;
+  refundScript: Uint8Array;
+  refundLeaf: TapLeafScript;
   solverLeaves: SolverLeaf[];
 }
 
@@ -106,16 +141,22 @@ function toXOnlyArray(keys: Uint8Array[]): Uint8Array[] {
 /**
  * Compose the deterministic escrow virtual output script from its keys.
  *
- * Leaf order: [release, solver_0, solver_1, ...] where solvers are sorted by
- * their x-only hex pubkey to ensure determinism across all participants.
+ * Leaf order: [release, refund, solver_0, solver_1, ...] where solvers are
+ * sorted by their x-only hex pubkey to ensure determinism across all
+ * participants.
  */
 export function buildEscrow(config: EscrowConfig, network: Network): Escrow {
   const buyer = toXOnly(config.buyerPubKey, "buyer");
   const seller = toXOnly(config.sellerPubKey, "seller");
   const server = toXOnly(config.serverPubKey, "server");
   const solverSet = toXOnlyArray(config.arbiterPubKeys);
+  const refundLocktime = config.refundLocktime ?? refundLocktimeFrom(Date.now() / 1000);
 
   const release = MultisigTapscript.encode({ pubkeys: [buyer, seller, server] });
+  const refund = CLTVMultisigTapscript.encode({
+    absoluteTimelock: refundLocktime,
+    pubkeys: [seller, server],
+  });
   const solverLeaves = solverSet
     .map((p) => ({ p, raw: MultisigTapscript.encode({ pubkeys: [p, server] }) }))
     .sort((a, b) => {
@@ -129,12 +170,13 @@ export function buildEscrow(config: EscrowConfig, network: Network): Escrow {
       leaf: { script: raw.script, version: 0xc0 as const },
     }));
 
-  const leavesList = [release.script, ...solverLeaves.map((s) => s.script)];
+  const leavesList = [release.script, refund.script, ...solverLeaves.map((s) => s.script)];
   const script = new VtxoScript(leavesList as any);
   const address = script.address(network.hrp, server).encode();
   const onchainAddress = script.onchainAddress(network);
 
   const releaseLeaf = script.findLeaf(hex.encode(release.script));
+  const refundLeaf = script.findLeaf(hex.encode(refund.script));
 
   const solverLeavesOut = solverLeaves.map((s) => ({
     pubkey: s.pubkey,
@@ -148,14 +190,51 @@ export function buildEscrow(config: EscrowConfig, network: Network): Escrow {
       sellerPubKey: seller,
       arbiterPubKeys: solverSet,
       serverPubKey: server,
+      refundLocktime,
     },
     script,
     address,
     onchainAddress,
+    refundLocktime,
     releaseScript: release.script,
     releaseLeaf,
+    refundScript: refund.script,
+    refundLeaf,
     solverLeaves: solverLeavesOut,
   };
+}
+
+/**
+ * The escrow-relevant fields of a trade agreement, as plain hex strings. Kept
+ * structural (rather than importing `EscrowAgreement`) to avoid a circular
+ * import between `escrow.ts` and `trade.ts`.
+ */
+export interface AgreementKeys {
+  buyerPubKey: string;
+  sellerPubKey: string;
+  arbiterPubKeys: string[];
+  serverPubKey: string;
+  refundLocktime?: string;
+}
+
+/**
+ * Decode an agreement into escrow config and build the escrow. Both parties
+ * call this with the same agreement, so they derive an identical script.
+ */
+export function escrowFromAgreement(agreement: AgreementKeys, network: Network): Escrow {
+  return buildEscrow(
+    {
+      buyerPubKey: hex.decode(agreement.buyerPubKey),
+      sellerPubKey: hex.decode(agreement.sellerPubKey),
+      arbiterPubKeys: agreement.arbiterPubKeys.map((x) => hex.decode(x)),
+      serverPubKey: hex.decode(agreement.serverPubKey),
+      refundLocktime:
+        agreement.refundLocktime !== undefined
+          ? BigInt(agreement.refundLocktime)
+          : refundLocktimeFrom(Date.now() / 1000),
+    },
+    network,
+  );
 }
 
 /** Script hexes to query the indexer for VTXOs locked to this escrow. */
@@ -198,14 +277,14 @@ export async function assertFunded(
 }
 
 function buildInput(escrow: Escrow, vtxo: VirtualCoin, path: EscrowPath): ArkTxInput {
-  if (path !== EscrowPath.Release) {
+  if (path !== EscrowPath.Release && path !== EscrowPath.Refund) {
     throw new Error("buildInput for arbiter requires solverPubKey");
   }
   return {
     txid: vtxo.txid,
     vout: vtxo.vout,
     value: vtxo.value,
-    tapLeafScript: escrow.releaseLeaf,
+    tapLeafScript: path === EscrowPath.Refund ? escrow.refundLeaf : escrow.releaseLeaf,
     tapTree: escrow.script.encode(),
   };
 }
@@ -482,6 +561,16 @@ export function verifyReleaseSpend(
   spend: SerializedSpend,
 ): void {
   verifySpend(escrow, vtxo, escrow.releaseLeaf[1], expected, spend);
+}
+
+/** Guard for a timelocked refund: must pay the seller via the `refund` leaf. */
+export function verifyRefundSpend(
+  escrow: Escrow,
+  vtxo: VirtualCoin,
+  expected: ReleaseExpectation,
+  spend: SerializedSpend,
+): void {
+  verifySpend(escrow, vtxo, escrow.refundLeaf[1], expected, spend);
 }
 
 /** Guard for an arbiter dispute spend: must pay the winner via the solver leaf. */

@@ -9,16 +9,18 @@ import type { NostrClient } from "../lib/nostr";
 import type { PeerLabel } from "../lib/useNyms";
 import {
   assertFunded,
-  buildEscrow,
   buildSpend,
   coSignSpend,
   EscrowPath,
+  escrowFromAgreement,
   findEscrowVtxo,
   mergeSpends,
   outputToArkAddress,
+  refundLocktimeFrom,
   signSpend,
   submitSpend,
   verifyArbiterSpend,
+  verifyRefundSpend,
   verifyReleaseSpend,
   type Escrow,
 } from "../lib/escrow";
@@ -39,6 +41,7 @@ import {
   buildDisputeAnnounceTemplate,
   buildDisputeTakeTemplate,
   buildDisputeResolutionTemplate,
+  buildOrderTemplate,
   pickDisputeTakeTaker,
   type DisputeAnnounce,
   type DisputeTake,
@@ -100,6 +103,13 @@ function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
+/**
+ * Window (seconds) a taken order has to produce the buyer's Ark address and get
+ * the escrow funded. Past it, the maker may cancel and republish (no funds have
+ * moved: the escrow VTXO does not exist yet).
+ */
+const TAKE_TIMEOUT_SECONDS = 15 * 60;
+
 /** Newest incoming `dispute`: only solvers in the set receive these. */
 function findActiveDispute(feed: TradeDm[]): TradeMessageOf<"dispute"> | null {
   for (let i = feed.length - 1; i >= 0; i--) {
@@ -146,6 +156,8 @@ export function TradePanel({
   const [disputeReason, setDisputeReason] = useState("");
 
   const [localVtxo, setLocalVtxo] = useState<VirtualCoin | null>(null);
+  // Coarse clock so timelock deadlines re-render without a per-second timer.
+  const [nowSec, setNowSec] = useState(() => nowSeconds());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
@@ -175,10 +187,22 @@ export function TradePanel({
 
   const effectiveOrderId = orderId.trim() || activeTake?.orderId || activeDispute?.orderId || "";
   const effectiveCounterparty = counterparty.trim() || activeTake?.from || "";
+  // DMs of this order regardless of counterparty filtering: used both to
+  // recover the counterparty when the request did not carry it and to rebuild
+  // the parties' payout addresses without depending on `cpPub` (which itself
+  // depends on the counterparty).
+  const orderFeed = effectiveOrderId
+    ? feed.filter((e) => e.msg?.orderId === effectiveOrderId)
+    : [];
+  const recoveredCounterparty =
+    counterparty.trim() ||
+    effectiveCounterparty ||
+    orderFeed.find((e) => !e.dm.outgoing)?.dm.sender ||
+    "";
 
   let cpPub: string | null = null;
   try {
-    cpPub = pubkeyFromInput(effectiveCounterparty);
+    cpPub = pubkeyFromInput(recoveredCounterparty);
   } catch {
     cpPub = null;
   }
@@ -232,13 +256,50 @@ export function TradePanel({
   const agreement = escrowMsg?.payload.agreement ?? disputeMsg?.payload.agreement ?? null;
   const agreedAddress = escrowMsg?.payload.address ?? "";
   const agreedRefundAddress = escrowMsg?.payload.refundAddress ?? "";
-  const buyerArk = lastOf("take")?.payload.buyerArkAddress ?? request?.buyerArkAddress ?? "";
   const pendingRelease = lastOf("release_request");
   const paymentDetails = lastOf("payment_details");
   const fundedMsg = lastOf("funded");
   const arbiterDecision = lastOf("arbiter_decision");
   const disputeTakenMsg = lastOf("dispute_taken");
   const releaseDone = lastOf("release_done");
+
+  // Recover both parties' Ark payout addresses from the persisted DMs, so
+  // reopening an operation (or a panel opened from Operación/Historial) never
+  // asks the user to type again an address they already provided when creating
+  // or taking the order. Priority: explicit `escrow`/`take` payloads, then the
+  // authenticated `ark_address` claims, then the dispute hints.
+  const claimedAddressOf = (pub: string): string => {
+    const target = pub.toLowerCase();
+    for (let i = orderFeed.length - 1; i >= 0; i--) {
+      const msg = orderFeed[i].msg;
+      if (msg?.type === "ark_address" && msg.from.toLowerCase() === target) {
+        return msg.payload.arkAddress.trim();
+      }
+    }
+    return "";
+  };
+  const escrowBuyerArk = lastOf("take")?.payload.buyerArkAddress ?? "";
+  const disputeBuyerArk = disputeMsg?.payload.buyerArkAddress ?? "";
+  const disputeSellerArk = disputeMsg?.payload.sellerArkAddress ?? "";
+  const recoveredBuyerArk = (
+    escrowBuyerArk ||
+    (agreement ? claimedAddressOf(agreement.buyerPubKey) : "") ||
+    disputeBuyerArk
+  ).trim();
+  const recoveredSellerArk = (
+    agreedRefundAddress ||
+    (agreement ? claimedAddressOf(agreement.sellerPubKey) : "") ||
+    disputeSellerArk
+  ).trim();
+  // Our own already-known Ark address, whichever side we play.
+  const ownRecoveredArk = (role === "seller" ? recoveredSellerArk : recoveredBuyerArk).trim();
+  // The buyer's payout address, from the `take` or any of the recovered sources.
+  const buyerArk =
+    lastOf("take")?.payload.buyerArkAddress ?? request?.buyerArkAddress ?? recoveredBuyerArk;
+  // The value in effect: whatever the user typed, else the address recovered
+  // from the feed. Prefilled on render (no effect) so reopening an operation
+  // never asks again for an address already given at creation/take time.
+  const effectiveMyArk = myArk.trim() || ownRecoveredArk;
 
   // True when our key is part of the escrow's committed solver set. For a
   // party the agreement comes from our own escrow DM; for a solver it arrives
@@ -319,32 +380,38 @@ export function TradePanel({
     fundedSats !== null && expectedSats !== null ? fundedSats === expectedSats : null;
 
   const escrow: Escrow | null =
-    agreement && ctx
-      ? buildEscrow(
-          {
-            buyerPubKey: hex.decode(agreement.buyerPubKey),
-            sellerPubKey: hex.decode(agreement.sellerPubKey),
-            arbiterPubKeys: agreement.arbiterPubKeys.map((x: string) => hex.decode(x)),
-            serverPubKey: hex.decode(agreement.serverPubKey),
-          },
-          ctx.network,
-        )
-      : null;
+    agreement && ctx ? escrowFromAgreement(agreement, ctx.network) : null;
+
+  // Re-render roughly once a minute so the timelock state stays current.
+  useEffect(() => {
+    const timer = setInterval(() => setNowSec(nowSeconds()), 60000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // The seller's timelocked refund opens once chain time reaches `refundLocktime`.
+  // We approximate chain time with wall clock (it tracks median-time-past).
+  const refundMature = Boolean(escrow && nowSec >= Number(escrow.refundLocktime));
+
+  // A taken order that produced neither the buyer's Ark address nor funding is
+  // stalled. The maker may cancel and republish once the window elapses; no
+  // funds have moved (the escrow VTXO does not exist yet), so this is safe and
+  // needs no counterparty agreement. The take's DM `createdAt` is relay-set, so
+  // it does not trust the sender's own clock.
+  const takeCreatedAt =
+    orderFeed.find((e) => e.msg?.type === "take" && !e.dm.outgoing)?.dm.createdAt ?? null;
+  const takeStalled = Boolean(
+    role === "seller" &&
+      takeCreatedAt !== null &&
+      !fundingKnown &&
+      nowSec - takeCreatedAt >= TAKE_TIMEOUT_SECONDS,
+  );
 
   // Auto-check funding: poll the indexer for the escrow VTXO so neither side
   // has to press "Comprobar fondeo". The query is public (no keys involved).
   useEffect(() => {
     if (!ctx || !agreement || fundingKnown) return;
     let cancelled = false;
-    const esc = buildEscrow(
-      {
-        buyerPubKey: hex.decode(agreement.buyerPubKey),
-        sellerPubKey: hex.decode(agreement.sellerPubKey),
-        arbiterPubKeys: agreement.arbiterPubKeys.map((x: string) => hex.decode(x)),
-        serverPubKey: hex.decode(agreement.serverPubKey),
-      },
-      ctx.network,
-    );
+    const esc = escrowFromAgreement(agreement, ctx.network);
     const poll = () => {
       findEscrowVtxo(ctx.indexer, esc)
         .then((found) => {
@@ -388,7 +455,7 @@ export function TradePanel({
   // in a dispute payload. Each solver authenticates the claim by the sender key.
   useEffect(() => {
     if (claimedRef.current || !escrowMsg || !identity || !effectiveOrderId) return;
-    const addr = myArk.trim();
+    const addr = effectiveMyArk;
     if (!addr) return;
     const agr = escrowMsg.payload.agreement;
     const recipients = new Set(agr.arbiterPubKeys.map((p) => p.toLowerCase()));
@@ -412,7 +479,7 @@ export function TradePanel({
     ).catch(() => {
       claimedRef.current = false;
     });
-  }, [escrowMsg, arbiter, identity, effectiveOrderId, myArk, role, client]);
+  }, [escrowMsg, arbiter, identity, effectiveOrderId, effectiveMyArk, role, client]);
 
   function run<T>(fn: () => Promise<T>) {
     setBusy(true);
@@ -448,9 +515,9 @@ export function TradePanel({
   }
 
   function handleSendTake() {
-    if (!myArk.trim()) throw new Error("indica tu dirección Ark de cobro");
+    if (!effectiveMyArk) throw new Error("indica tu dirección Ark de cobro");
     run(async () => {
-      await send("take", { buyerArkAddress: myArk.trim() });
+      await send("take", { buyerArkAddress: effectiveMyArk });
       setStatus("Toma enviada al vendedor.");
     });
   }
@@ -496,10 +563,52 @@ export function TradePanel({
     });
   }
 
+  /**
+   * Maker-only: cancel a stalled taken order and republish a fresh, equivalent
+   * offer. Safe because nothing was funded (the escrow VTXO does not exist), so
+   * it needs no counterparty agreement.
+   */
+  function handleCancelAndRepublish() {
+    if (!identity) throw new Error("sin identidad");
+    if (role !== "seller") throw new Error("solo el creador de la orden puede republicar");
+    if (!takeStalled) throw new Error("la operación aún está dentro del plazo");
+    const fiat = agreement?.fiat ?? (request?.fiat ?? "USD");
+    const fiatAmount = agreement?.fiatAmount ?? request?.fiatAmount;
+    const tradeSats = agreement?.tradeSats ?? request?.tradeSats;
+    if (fiatAmount === undefined || tradeSats === undefined) {
+      throw new Error("faltan datos de la orden para republicar");
+    }
+    const methods =
+      request?.paymentMethods ??
+      payMethods
+        .split(",")
+        .map((m) => m.trim())
+        .filter(Boolean);
+    run(async () => {
+      // Best effort: retire the stalled listing. A new `d` is published below,
+      // so relays without NIP-09 support still only surface the fresh order.
+      await client.setOrderStatus(identity, effectiveOrderId, "canceled").catch(() => undefined);
+      const template = buildOrderTemplate({
+        type: "sell",
+        fiat,
+        fiatAmount,
+        amountSats: tradeSats,
+        premium: 0,
+        paymentMethods: methods,
+        expiresAt: nowSeconds() + 24 * 3600,
+        name: identity.npub,
+        arkRefundAddress: effectiveMyArk || recoveredSellerArk || undefined,
+      });
+      const event = await client.publish(template, identity);
+      const id = event.tags.find((t) => t[0] === "d")?.[1] ?? event.id;
+      setStatus(`Operación cancelada y republicada como ${id.slice(0, 8)}…`);
+    });
+  }
+
   function handleBuildAgreement() {
     if (!identity || !ctx) throw new Error("falta identidad o ASP");
     if (!cpPub) throw new Error("contraparte inválida (npub o hex)");
-    if (!myArk.trim()) throw new Error("indica tu dirección Ark para reembolsos");
+    if (!effectiveMyArk) throw new Error("indica tu dirección Ark para reembolsos");
     run(async () => {
       // Solver set comes from the coordinator's replaceable registry event;
       // fall back to VITE_ARBITER so the app still works without a registry.
@@ -526,26 +635,19 @@ export function TradePanel({
         sellerPubKey: identity.pubkeyHex,
         arbiterPubKeys: solverSet,
         serverPubKey: hex.encode(ctx.serverPubKey),
+        refundLocktime: refundLocktimeFrom(Date.now() / 1000).toString(),
       };
-      const built = buildEscrow(
-        {
-          buyerPubKey: hex.decode(agr.buyerPubKey),
-          sellerPubKey: hex.decode(agr.sellerPubKey),
-          arbiterPubKeys: agr.arbiterPubKeys.map((x: string) => hex.decode(x)),
-          serverPubKey: hex.decode(agr.serverPubKey),
-        },
-        ctx.network,
-      );
+      const built = escrowFromAgreement(agr, ctx.network);
       await send("escrow", {
         agreement: agr,
         address: built.address,
-        refundAddress: myArk.trim(),
+        refundAddress: effectiveMyArk,
       });
       // Advertise our payout address to every solver so disputes never rely on
       // the addresses a disputant claims on the counterparty's behalf.
       claimedRef.current = true;
       void Promise.allSettled(
-        solverSet.map((solver) => sendTo(solver, "ark_address", { agreement: agr, arkAddress: myArk.trim() })),
+        solverSet.map((solver) => sendTo(solver, "ark_address", { agreement: agr, arkAddress: effectiveMyArk })),
       ).catch(() => undefined);
       setStatus(`Escrow acordado con ${solverSet.length} solver(s). Dirección a fondear: ${built.address}`);
     });
@@ -600,7 +702,8 @@ export function TradePanel({
     }
     const spend = pendingRelease.payload.spend;
     const dest = pendingRelease.payload.to;
-    if (dest !== myArk.trim()) {
+    const myAddress = effectiveMyArk || recoveredBuyerArk;
+    if (dest.trim() !== myAddress) {
       throw new Error("la liberación no paga a la dirección Ark indicada");
     }
     run(async () => {
@@ -613,12 +716,42 @@ export function TradePanel({
     });
   }
 
+  /**
+   * Seller-only: after the timelock matures, reclaim the escrow through the
+   * `refund` leaf (seller + server). No solver is involved. If the buyer has
+   * paid and not been released, they must have opened a dispute before now.
+   */
+  function handleRefund() {
+    if (!identity || !ctx) throw new Error("falta identidad o ASP");
+    if (!escrow || !vtxo || !agreement) throw new Error("falta escrow fondeado o acuerdo");
+    if (role !== "seller") throw new Error("solo el vendedor puede reclamar el reembolso");
+    if (!refundMature) throw new Error("el reembolso aún no está disponible (plazo sin vencer)");
+    const dest = effectiveMyArk || recoveredSellerArk;
+    if (!dest) throw new Error("falta tu dirección Ark de cobro");
+    run(async () => {
+      const outputs = [outputToArkAddress(dest, BigInt(agreement.tradeSats))];
+      const partial = buildSpend(ctx.info, escrow, vtxo, EscrowPath.Refund, outputs);
+      const signed = await signSpend(partial, identity);
+      verifyRefundSpend(escrow, vtxo, { destination: dest, sats: agreement.tradeSats }, signed);
+      const arkTxid = await submitSpend(ctx.ark, signed);
+      await sendTo(agreement.buyerPubKey, "arbiter_decision", {
+        outcome: "refund_to_seller",
+        destination: dest,
+        sats: agreement.tradeSats,
+        arkTxid,
+      }).catch(() => undefined);
+      setStatus(`Reembolso enviado al servidor (${arkTxid}).`);
+    });
+  }
+
   /** Buyer or seller escalates to every solver in the escrow's solver set. */
   function handleOpenDispute() {
     if (!identity) throw new Error("sin identidad");
     if (!agreement) throw new Error("aún no hay acuerdo de escrow");
-    const buyerAddress = role === "buyer" ? myArk.trim() : buyerArk.trim();
-    const sellerAddress = role === "seller" ? myArk.trim() : agreedRefundAddress;
+    const buyerAddress =
+      (role === "buyer" ? effectiveMyArk : buyerArk.trim()) || recoveredBuyerArk;
+    const sellerAddress =
+      (role === "seller" ? effectiveMyArk : agreedRefundAddress) || recoveredSellerArk;
     if (!buyerAddress) throw new Error("falta la dirección Ark del comprador");
     if (!sellerAddress) throw new Error("falta la dirección Ark del vendedor");
     const reason = disputeReason.trim() || "sin motivo especificado";
@@ -706,15 +839,7 @@ export function TradePanel({
       );
     }
     run(async () => {
-      const esc = buildEscrow(
-        {
-          buyerPubKey: hex.decode(p.agreement.buyerPubKey),
-          sellerPubKey: hex.decode(p.agreement.sellerPubKey),
-          arbiterPubKeys: p.agreement.arbiterPubKeys.map((x: string) => hex.decode(x)),
-          serverPubKey: hex.decode(p.agreement.serverPubKey),
-        },
-        ctx.network,
-      );
+      const esc = escrowFromAgreement(p.agreement, ctx.network);
       const held = await assertFunded(ctx.indexer, esc, sats);
       const outputs = [outputToArkAddress(destination, BigInt(sats))];
       const partial = buildSpend(ctx.info, esc, held, EscrowPath.Arbiter, outputs, identity.pubkeyHex);
@@ -797,7 +922,7 @@ export function TradePanel({
         {!solverView && (
           <input
             placeholder="contraparte npub o hex"
-            value={effectiveCounterparty}
+            value={recoveredCounterparty}
             onChange={(e) => setCounterparty(e.target.value)}
             style={{ width: 320 }}
           />
@@ -818,6 +943,23 @@ export function TradePanel({
         </p>
       )}
 
+      {takeStalled && (
+        <div style={{ padding: 8, border: "1px solid #f59e0b55", borderRadius: 8, marginTop: 8 }}>
+          <p style={{ fontSize: "0.9em", color: "#b45309", margin: 0 }}>
+            La orden fue tomada hace más de 15 minutos sin recibir la dirección Ark del comprador ni
+            el fondeo del escrow. Puedes cancelarla y publicar una nueva (no se movió ningún fondo).
+          </p>
+          <button
+            type="button"
+            style={{ marginTop: 8 }}
+            disabled={busy || !identity}
+            onClick={handleCancelAndRepublish}
+          >
+            Cancelar y republicar orden
+          </button>
+        </div>
+      )}
+
       {!solverView && role === "seller" && (
         <>
           <h3>Acuerdo de escrow</h3>
@@ -835,7 +977,7 @@ export function TradePanel({
             <input placeholder="fiat (USD, CUP…)" value={fiat} onChange={(e) => setFiat(e.target.value)} />
             <input
               placeholder="mi dirección Ark (reembolsos)"
-              value={myArk}
+              value={myArk || ownRecoveredArk}
               onChange={(e) => setMyArk(e.target.value)}
             />
           </div>
@@ -857,7 +999,27 @@ export function TradePanel({
             >
               Solicitar liberación (firmar y enviar)
             </button>
+            <button
+              type="button"
+              disabled={busy || !vtxo || !refundMature || releaseDone !== null}
+              title={
+                refundMature
+                  ? undefined
+                  : escrow
+                    ? `El reembolso se habilita el ${new Date(Number(escrow.refundLocktime) * 1000).toLocaleString()}`
+                    : undefined
+              }
+              onClick={handleRefund}
+            >
+              Reclamar reembolso tras el plazo
+            </button>
           </div>
+          {vtxo && escrow && !refundMature && releaseDone === null && (
+            <p className="panel-note" style={{ fontSize: "0.85em", opacity: 0.8 }}>
+              Protección del vendedor: si el comprador no libera ni abre disputa, podrás reclamar el
+              escrow el {new Date(Number(escrow.refundLocktime) * 1000).toLocaleString()}.
+            </p>
+          )}
 
           <h3>Datos de pago (los recibe el comprador)</h3>
           <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 520 }}>
@@ -889,14 +1051,14 @@ export function TradePanel({
           <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 520 }}>
             <input
               placeholder="mi dirección Ark de cobro"
-              value={myArk}
+              value={myArk || ownRecoveredArk}
               onChange={(e) => setMyArk(e.target.value)}
             />
           </div>
           <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button
               type="button"
-              disabled={busy || !canSend || !myArk.trim() || takeSent}
+              disabled={busy || !canSend || !effectiveMyArk || takeSent}
               onClick={handleSendTake}
             >
               {takeSent ? "Toma enviada" : "Enviar toma (take)"}

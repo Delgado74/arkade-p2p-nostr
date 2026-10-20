@@ -29,6 +29,12 @@ export interface EscrowAgreement {
   arbiterPubKeys: string[];
   /** ASP co-signer x-only hex pubkey (`hex.encode(ctx.serverPubKey)`). */
   serverPubKey: string;
+  /**
+   * Absolute timelock (in blocks) of the escrow's `refund` leaf, as a string to
+   * survive JSON. Both parties must agree on it so they derive the same script.
+   * Absent on legacy agreements, in which case the default is used.
+   */
+  refundLocktime?: string;
 }
 
 /** Payload variants keyed by message type. */
