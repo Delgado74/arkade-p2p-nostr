@@ -82,6 +82,21 @@ function num(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+/** True when the event declares our platform in the NIP-69 `y` tag. */
+function isOurPlatform(event: Event): boolean {
+  return event.tags.some((t) => t[0] === "y" && t.slice(1).includes(PLATFORM));
+}
+
+/** True when the event carries the expected `z` discriminator. */
+function hasZ(event: Event, value: string): boolean {
+  return event.tags.some((t) => t[0] === "z" && t[1] === value);
+}
+
+/** Nostr public keys are 32-byte hex; roles like `buyer`/`seller` are not. */
+function isHex64(value: string | undefined): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
+}
+
 /** Generate a fresh addressable order id. */
 export function newOrderId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -190,8 +205,15 @@ export function isExpired(order: Order, now = Date.now() / 1000): boolean {
   return order.expiresAt < now;
 }
 
-/** NIP-33-style replaceable events for disputes (multi-solver). */
-export const DISPUTE_KIND = 38386;
+/**
+ * NIP-33-style replaceable events for disputes (multi-solver).
+ *
+ * `38386` is taken by Mostro's dispute events, which also carry `d`, `s` and
+ * `initiator`; publishing there makes our events indistinguishable to their
+ * tooling and theirs indistinguishable to ours. We use `38390` instead and
+ * keep `y = arkade-p2p` as the discriminator on every dispute event.
+ */
+export const DISPUTE_KIND = 38390;
 export const DISPUTE_TAKE_KIND = 38387;
 export const DISPUTE_RESOLUTION_KIND = 38388;
 
@@ -238,10 +260,11 @@ export interface DisputeAnnounce {
 
 export function parseDisputeAnnounce(event: Event): DisputeAnnounce | null {
   if (event.kind !== DISPUTE_KIND) return null;
+  if (!isOurPlatform(event) || !hasZ(event, "dispute")) return null;
   const d = tag(event, "d");
   const status = tag(event, "s");
   const initiator = tag(event, "initiator");
-  if (!d || !status || !initiator) return null;
+  if (!d || !status || !isHex64(initiator)) return null;
   return {
     id: d,
     pubkey: event.pubkey,
@@ -264,11 +287,12 @@ export interface DisputeTake {
 
 export function parseDisputeTake(event: Event): DisputeTake | null {
   if (event.kind !== DISPUTE_TAKE_KIND) return null;
+  if (!isOurPlatform(event) || !hasZ(event, "dispute-take")) return null;
   const d = tag(event, "d");
   const solver = tag(event, "solver");
   const e = event.tags.find((t) => t[0] === "e")?.[1];
   const orderId = d || e;
-  if (!orderId || !solver) return null;
+  if (!orderId || !isHex64(solver)) return null;
   return {
     id: orderId,
     pubkey: event.pubkey,
@@ -292,13 +316,14 @@ export interface DisputeResolution {
 
 export function parseDisputeResolution(event: Event): DisputeResolution | null {
   if (event.kind !== DISPUTE_RESOLUTION_KIND) return null;
+  if (!isOurPlatform(event) || !hasZ(event, "dispute-resolution")) return null;
   const d = tag(event, "d");
   const e = event.tags.find((t) => t[0] === "e")?.[1];
   const status = tag(event, "s");
   const solver = tag(event, "solver");
   const ark = tag(event, "ark_txid");
   const orderId = d || e;
-  if (!orderId || !status || !solver) return null;
+  if (!orderId || !status || !isHex64(solver)) return null;
   return {
     id: orderId,
     pubkey: event.pubkey,

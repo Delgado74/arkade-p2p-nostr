@@ -288,7 +288,7 @@ export class NostrClient {
     return { close: () => subscription.close() };
   }
 
-  /** Subscribe to dispute announcements (38386) for a given order or globally. */
+  /** Subscribe to dispute announcements (38390) for a given order or globally. */
   subscribeDisputes(
     handlers: { onDispute: (d: DisputeAnnounce) => void; onEose?: () => void },
     opts?: { orderId?: string },
