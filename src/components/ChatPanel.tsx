@@ -119,10 +119,11 @@ function agreementFor(orderId: string, feed: TradeDm[]) {
 }
 
 /**
- * Who hears our chat in a dispute: a solver writes to both parties, a party
- * writes to the solver that took the race (or to the other party meanwhile).
+ * Who we can write to inside a dispute room. A solver writes to each party
+ * separately (to collect that side's evidence); a party writes to the solver
+ * that took the race, or to the other party until one does.
  */
-function disputeRecipients(
+function disputePeers(
   orderId: string,
   feed: TradeDm[],
   takes: DisputeTake[],
@@ -143,6 +144,27 @@ function disputeRecipients(
   return orderPeers(orderId, feed, myPubKey);
 }
 
+/** The role a peer plays in the trade, for the dispute peer selector. */
+function peerRoleIn(
+  orderId: string,
+  peer: string,
+  feed: TradeDm[],
+): TradeRole | null {
+  const agreement = agreementFor(orderId, feed);
+  if (!agreement) return null;
+  const target = peer.toLowerCase();
+  if (agreement.buyerPubKey.toLowerCase() === target) return "buyer";
+  if (agreement.sellerPubKey.toLowerCase() === target) return "seller";
+  return null;
+}
+
+/** `Comprador`/`Vendedor` for a party, empty for anyone else. */
+function peerLabelIn(orderId: string, peerKey: string, feed: TradeDm[]): string {
+  const role = peerRoleIn(orderId, peerKey, feed);
+  return role === "buyer" ? "Comprador" : role === "seller" ? "Vendedor" : "";
+}
+
+
 export function ChatPanel({
   identity,
   client,
@@ -158,6 +180,9 @@ export function ChatPanel({
   const [segment, setSegment] = useState<Segment>("mensajes");
   const [openRoom, setOpenRoom] = useState<OpenRoom>(null);
   const [draft, setDraft] = useState("");
+  // Recipient selected inside a dispute room (a solver talks to each party
+  // separately; a party talks to the solver that took the dispute).
+  const [disputePeer, setDisputePeer] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -180,7 +205,9 @@ export function ChatPanel({
     [feed, disputeAnnounces, disputeTakes, disputeResolutions, identity.pubkeyHex, readMarks],
   );
 
-  const messageConvs = conversations.filter((c) => !c.disputeOnly);
+  const messageConvs = conversations.filter(
+    (c) => !c.orderId || operations.some((o) => o.orderId === c.orderId),
+  );
 
   // While a room is open its own badge stays at zero without touching storage.
   const unreadOf = (key: string, unread: number) =>
@@ -197,6 +224,16 @@ export function ChatPanel({
   const openDispute = openRoom?.segment === "disputas"
     ? disputes.find((d) => `dispute:${d.orderId}` === openRoom.key) ?? null
     : null;
+
+  // Peers a dispute message can be addressed to, and the currently selected
+  // one (defaulted to the first when the room opens).
+  const disputePeerOptions = openDispute
+    ? disputePeers(openDispute.orderId, feed, disputeTakes, identity.pubkeyHex)
+    : [];
+  const activeDisputePeer =
+    disputePeer && disputePeerOptions.includes(disputePeer)
+      ? disputePeer
+      : (disputePeerOptions[0] ?? null);
 
   function markRead(key: string, messages: ChatMessage[]) {
     const last = messages[messages.length - 1];
@@ -215,6 +252,7 @@ export function ChatPanel({
   function openDisputeRoom(room: DisputeRoom) {
     const key = `dispute:${room.orderId}`;
     markRead(key, room.messages);
+    setDisputePeer(null);
     setOpenRoom({ segment: "disputas", key });
     setError("");
   }
@@ -235,7 +273,7 @@ export function ChatPanel({
       recipients = [openConv.peer];
     } else if (openDispute) {
       orderId = openDispute.orderId;
-      recipients = disputeRecipients(orderId, feed, disputeTakes, identity.pubkeyHex);
+      recipients = activeDisputePeer ? [activeDisputePeer] : [];
     }
     if (recipients.length === 0) {
       setError("no hay destinatarios conocidos para esta conversación");
@@ -441,6 +479,26 @@ export function ChatPanel({
             {title.chip && <span className="chat-chip">En disputa</span>}
           </div>
 
+          {openDispute && disputePeerOptions.length > 0 && (
+            <div className="chat-peer-picker">
+              <span className="chat-peer-picker-label">Hablar con:</span>
+              {disputePeerOptions.map((p) => {
+                const name = peerLabelIn(openDispute.orderId, p, feed) || peer(p);
+                return (
+                  <button
+                    key={p}
+                    type="button"
+                    className="chat-peer-chip"
+                    data-active={p === activeDisputePeer}
+                    onClick={() => setDisputePeer(p)}
+                  >
+                    {name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
           <div className="chat-messages">
             {messages.length === 0 && <p className="chat-system">Sin mensajes todavía.</p>}
             {messages.map((m) =>
@@ -450,6 +508,11 @@ export function ChatPanel({
                 </p>
               ) : (
                 <div key={m.id} className="chat-bubble" data-own={m.outgoing}>
+                  {openDispute && !m.outgoing && m.sender && (
+                    <span className="chat-bubble-sender">
+                      {peerLabelIn(openDispute.orderId, m.sender, feed) || peer(m.sender)}
+                    </span>
+                  )}
                   {m.text}
                   <time>{timeLabel(m.ts)}</time>
                 </div>

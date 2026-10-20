@@ -97,8 +97,14 @@ export function peerOf(dm: DirectMessage, myPubKey: string): string {
   return other ?? dm.sender;
 }
 
-/** Message types whose rooms belong to the Disputas segment. */
-const DISPUTE_TYPES = new Set(["dispute", "dispute_taken", "arbiter_decision", "ark_address"]);
+/**
+ * Message types whose rooms belong to the Disputas segment.
+ *
+ * `ark_address` is deliberately excluded: parties advertise their payout
+ * addresses when the escrow is agreed, long before any dispute exists, so it
+ * must not spawn a dispute room (nor mark the conversation as dispute-only).
+ */
+const DISPUTE_TYPES = new Set(["dispute", "dispute_taken", "arbiter_decision"]);
 
 function toChatMessage({ dm, msg }: TradeDm): ChatMessage {
   return {
