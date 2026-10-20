@@ -326,6 +326,10 @@
   backdrop-filter: blur(12px);
 }
 
+.bottom-nav[data-columns="4"] {
+  grid-template-columns: repeat(4, 1fr);
+}
+
 .nav-item {
   display: flex;
   flex-direction: column;
@@ -795,6 +799,25 @@
   color: var(--sell-ink);
 }
 
+.op-status[data-status="pending"] {
+  border-color: var(--chip-dispute-border);
+  background: var(--chip-dispute-bg);
+  color: var(--chip-dispute-ink);
+}
+
+.op-status[data-status="mine"] {
+  border-color: var(--lime-soft-border);
+  background: var(--lime-soft);
+  color: var(--lime-ink);
+}
+
+.op-status[data-status="taken"],
+.op-status[data-status="resolved"] {
+  border-color: var(--border);
+  background: var(--surface-muted);
+  color: var(--text-tertiary);
+}
+
 .op-date {
   font-size: 11px;
   color: var(--text-faint);
@@ -833,6 +856,13 @@
   color: var(--text-faint);
   font-size: 11px;
   word-break: break-all;
+}
+
+.op-reason {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .op-actions {

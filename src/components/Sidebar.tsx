@@ -5,6 +5,7 @@ import {
   ChatIcon,
   CloseIcon,
   KeyIcon,
+  ShieldIcon,
   ToolboxIcon,
 } from "./icons";
 import { navRoot, type Screen } from "./nav";
@@ -14,12 +15,23 @@ interface Props {
   active: Screen;
   chatUnread: number;
   activeOps: number;
+  solverActive: number;
+  isSolver: boolean;
   onNavigate: (screen: Screen) => void;
   onClose: () => void;
 }
 
 /** Mostro-style menu: navigation first, account and tools below it. */
-export function Sidebar({ open, active, chatUnread, activeOps, onNavigate, onClose }: Props) {
+export function Sidebar({
+  open,
+  active,
+  chatUnread,
+  activeOps,
+  solverActive,
+  isSolver,
+  onNavigate,
+  onClose,
+}: Props) {
   const root = navRoot(active);
 
   return (
@@ -68,6 +80,18 @@ export function Sidebar({ open, active, chatUnread, activeOps, onNavigate, onClo
             <span>Chat</span>
             {chatUnread > 0 && <span className="nav-badge">{chatUnread}</span>}
           </button>
+          {isSolver && (
+            <button
+              type="button"
+              className="nav-row"
+              data-active={root === "disputes"}
+              onClick={() => onNavigate("disputes")}
+            >
+              <ShieldIcon />
+              <span>Disputas</span>
+              {solverActive > 0 && <span className="nav-badge">{solverActive}</span>}
+            </button>
+          )}
         </nav>
 
         <div className="sidebar-separator" />

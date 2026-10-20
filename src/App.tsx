@@ -20,7 +20,9 @@ import type {
   DisputeTake,
   Order,
   OrderType,
+  SolverRegistry,
 } from "./lib/protocol";
+import { coordinatorPubKey } from "./lib/config";
 import { isFinished, loadOperations, recordOperation, type OperationRecord } from "./lib/operations";
 import {
   buildConversations,
@@ -36,6 +38,8 @@ import { EscrowHarness } from "./components/EscrowHarness";
 import { OperationsPanel } from "./components/OperationsPanel";
 import { TradePanel, type TradeRequest } from "./components/TradePanel";
 import { ChatPanel } from "./components/ChatPanel";
+import { SolverInbox } from "./components/SolverInbox";
+import { activeSolverDisputes, buildSolverDisputes, isListedSolver } from "./lib/solver";
 import { Sidebar } from "./components/Sidebar";
 import { BottomNav } from "./components/BottomNav";
 import { AddOrderButton } from "./components/AddOrderButton";
@@ -60,6 +64,7 @@ const SCREEN_META: Record<Screen, { title: string; sub: string }> = {
   trades: { title: "Mis operaciones", sub: "Operaciones en curso y terminadas" },
   trade: { title: "Operación", sub: "Escrow, pago fiat y mensajes" },
   chat: { title: "Chat", sub: "Mensajes y disputas" },
+  disputes: { title: "Disputas", sub: "Solicitudes donde tu clave es solver" },
   account: { title: "Cuenta y claves", sub: "Identidad Nostr/Arkade y conexión con el ASP" },
   rates: { title: "Tasas", sub: "Precio de referencia y prima" },
   escrow: { title: "Escrow (pruebas)", sub: "Banco de pruebas del escrow Arkade" },
@@ -95,6 +100,9 @@ export default function App() {
   const [disputeAnnounces, setDisputeAnnounces] = useState<DisputeAnnounce[]>([]);
   const [disputeTakes, setDisputeTakes] = useState<DisputeTake[]>([]);
   const [disputeResolutions, setDisputeResolutions] = useState<DisputeResolution[]>([]);
+  // Coordinator-published solver registry. Read-only: only the coordinator
+  // (signing the 38389 event) can list a key, so a client can never opt in.
+  const [solverRegistry, setSolverRegistry] = useState<SolverRegistry | null>(null);
 
   const client = nostrClient();
 
@@ -235,6 +243,26 @@ export default function App() {
     };
   }, [client]);
 
+  // Solver registry: read-only fetch plus live updates, so the Disputas screen
+  // appears/disappears as soon as the coordinator changes the published list.
+  useEffect(() => {
+    const coordinator = coordinatorPubKey();
+    let cancelled = false;
+    client
+      .fetchSolvers(coordinator)
+      .then((reg) => {
+        if (!cancelled && reg) setSolverRegistry(reg);
+      })
+      .catch(() => undefined);
+    const subscription = client.subscribeSolvers(coordinator, {
+      onRegistry: (reg) => setSolverRegistry(reg),
+    });
+    return () => {
+      cancelled = true;
+      subscription.close();
+    };
+  }, [client]);
+
   // Badges for the menu and the bottom bar. Read marks live here so both
   // surfaces stay in sync with the chat screen.
   const conversations = useMemo(
@@ -257,6 +285,17 @@ export default function App() {
     conversations.reduce((sum, c) => (c.disputeOnly ? sum : sum + c.unread), 0) +
     disputeRooms.reduce((sum, d) => sum + d.unread, 0);
   const activeOps = operations.filter((op) => !isFinished(op.status)).length;
+  // Only keys published in the coordinator's registry may act as solvers. The
+  // Disputas screen is hidden for everyone else; there is no self opt-in.
+  const isSolver = isListedSolver(solverRegistry, identity.pubkeyHex);
+  const solverDisputes = useMemo(
+    () =>
+      isSolver
+        ? buildSolverDisputes(feed, disputeTakes, disputeResolutions, identity.pubkeyHex)
+        : [],
+    [isSolver, feed, disputeTakes, disputeResolutions, identity.pubkeyHex],
+  );
+  const solverActive = activeSolverDisputes(solverDisputes);
 
   function navigate(screen: Screen) {
     setSidebarOpen(false);
@@ -366,14 +405,28 @@ export default function App() {
     navigate("trade");
   }
 
+  function openSolverDispute(orderId: string) {
+    setTradeRequest({
+      orderId,
+      counterparty: "",
+      role: "seller",
+      solver: true,
+    });
+    navigate("trade");
+  }
+
   // A finished trade leaves the Operación screen and lives in Mis operaciones.
   const activeOperation = tradeRequest
     ? operations.find((op) => op.orderId === tradeRequest.orderId)
     : undefined;
   const tradeFinished = activeOperation !== undefined && isFinished(activeOperation.status);
 
-  const meta = SCREEN_META[tab];
-  const backTarget = BACK_TARGET[tab];
+  // A non-solver can never land on the Disputas screen (e.g. after switching
+  // identity): derive the effective screen instead of mutating state.
+  const screen: Screen = !isSolver && tab === "disputes" ? "book" : tab;
+
+  const meta = SCREEN_META[screen];
+  const backTarget = screen === "trade" && tradeRequest?.solver ? "disputes" : BACK_TARGET[screen];
 
   return (
     <div className="app">
@@ -387,9 +440,11 @@ export default function App() {
       )}
       <Sidebar
         open={sidebarOpen}
-        active={tab}
+        active={screen}
         chatUnread={chatUnread}
         activeOps={activeOps}
+        solverActive={solverActive}
+        isSolver={isSolver}
         onNavigate={navigate}
         onClose={() => setSidebarOpen(false)}
       />
@@ -432,7 +487,7 @@ export default function App() {
         <div className="content">
           {error && <p className="alert">Error: {error}</p>}
 
-          {tab === "book" && (
+          {screen === "book" && (
             <OrderBook
               client={client}
               identity={identity}
@@ -441,7 +496,7 @@ export default function App() {
             />
           )}
 
-          {tab === "create" && (
+          {screen === "create" && (
             <OrderForm
               key={createType}
               client={client}
@@ -455,11 +510,11 @@ export default function App() {
             />
           )}
 
-          {tab === "trades" && (
+          {screen === "trades" && (
             <OperationsPanel operations={operations} onOpen={openOperation} />
           )}
 
-          {tab === "trade" &&
+          {screen === "trade" &&
             (tradeFinished ? (
               <section className="panel">
                 <h2>Operación finalizada</h2>
@@ -493,7 +548,14 @@ export default function App() {
               />
             ))}
 
-          {tab === "chat" && (
+          {screen === "disputes" &&
+            (isSolver ? (
+              <SolverInbox disputes={solverDisputes} onOpen={openSolverDispute} />
+            ) : (
+              <p className="empty">Esta clave no figura como solver de esta comunidad.</p>
+            ))}
+
+          {screen === "chat" && (
             <ChatPanel
               identity={identity}
               client={client}
@@ -507,7 +569,7 @@ export default function App() {
             />
           )}
 
-          {tab === "account" && (
+          {screen === "account" && (
             <section className="panel">
               <p className="panel-note">
                 Tu clave se genera automáticamente y se guarda en esta pestaña. Cada pestaña o
@@ -574,19 +636,21 @@ export default function App() {
             </section>
           )}
 
-          {tab === "rates" && <RatesPanel />}
-          {tab === "escrow" && <EscrowHarness identity={identity} ctx={ctx} />}
+          {screen === "rates" && <RatesPanel />}
+          {screen === "escrow" && <EscrowHarness identity={identity} ctx={ctx} />}
         </div>
 
         <BottomNav
-          active={tab}
+          active={screen}
           chatUnread={chatUnread}
           activeOps={activeOps}
+          solverActive={solverActive}
+          isSolver={isSolver}
           onNavigate={navigate}
         />
       </div>
 
-      {tab === "book" && <AddOrderButton onCreate={openCreate} />}
+      {screen === "book" && <AddOrderButton onCreate={openCreate} />}
     </div>
   );
 }

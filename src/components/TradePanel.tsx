@@ -56,6 +56,8 @@ export interface TradeRequest {
   buyerArkAddress?: string;
   /** Seller's refund address, taken from the maker's order (sell orders). */
   refundAddress?: string;
+  /** Opened from the solver inbox: no counterparty filter, resolution UI only. */
+  solver?: boolean;
 }
 
 interface Props {
@@ -64,7 +66,7 @@ interface Props {
   client: NostrClient;
   request?: TradeRequest | null;
   feed: TradeDm[];
-  /** Public dispute announcements (kind 38386). */
+  /** Public dispute announcements (kind 38390). */
   disputeAnnounces?: DisputeAnnounce[];
   /** Public dispute takes (kind 38387), including competing takes. */
   disputeTakes?: DisputeTake[];
@@ -159,9 +161,10 @@ export function TradePanel({
     }
   }, []);
 
-  const activeTake = role === "seller" ? findActiveTake(feed) : null;
+  const solverView = Boolean(request?.solver);
+  const activeTake = !solverView && role === "seller" ? findActiveTake(feed) : null;
   // Only solvers receive dispute DMs, so an incoming one means we are a solver.
-  const activeDispute = findActiveDispute(feed);
+  const activeDispute = solverView ? null : findActiveDispute(feed);
 
   const effectiveOrderId = orderId.trim() || activeTake?.orderId || activeDispute?.orderId || "";
   const effectiveCounterparty = counterparty.trim() || activeTake?.from || "";
@@ -173,11 +176,28 @@ export function TradePanel({
     cpPub = null;
   }
 
+  // A solver must see both parties' messages for the order; filtering by a
+  // single counterparty would hide the other side's authenticated address.
+  const solverChat = Boolean(
+    identity &&
+      effectiveOrderId &&
+      (solverView ||
+        feed.some(
+          (entry) =>
+            !entry.dm.outgoing &&
+            entry.msg?.type === "dispute" &&
+            entry.msg.orderId === effectiveOrderId &&
+            entry.msg.payload.agreement.arbiterPubKeys.some(
+              (p) => p.toLowerCase() === identity.pubkeyHex.toLowerCase(),
+            ),
+        )),
+  );
+
   const relevant = feed
     .filter(({ dm, msg }) => {
       if (!msg) return false;
       if (effectiveOrderId && msg.orderId !== effectiveOrderId) return false;
-      if (cpPub) {
+      if (cpPub && !solverChat) {
         const withCounterparty = dm.outgoing ? dm.recipients.includes(cpPub) : dm.sender === cpPub;
         if (!withCounterparty) return false;
       }
@@ -738,6 +758,12 @@ export function TradePanel({
           Esta clave está en el solver set de este escrow: aquí recibes disputas y las resuelves.
         </p>
       )}
+      {solverView && (
+        <p style={{ color: "#2563eb", fontSize: "0.9em" }}>
+          Modo solver: ves los mensajes de ambas partes. Toma la disputa y resuélvela en la
+          sección de abajo.
+        </p>
+      )}
 
       {releaseDone && (
         <p style={{ color: "green", fontWeight: 700 }}>
@@ -747,24 +773,28 @@ export function TradePanel({
       )}
 
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-        <label>
-          Rol{" "}
-          <select value={role} onChange={(e) => setRole(e.target.value as TradeRole)}>
-            <option value="seller">Vendedor</option>
-            <option value="buyer">Comprador</option>
-          </select>
-        </label>
+        {!solverView && (
+          <label>
+            Rol{" "}
+            <select value={role} onChange={(e) => setRole(e.target.value as TradeRole)}>
+              <option value="seller">Vendedor</option>
+              <option value="buyer">Comprador</option>
+            </select>
+          </label>
+        )}
         <input
           placeholder="order id (d)"
           value={effectiveOrderId}
           onChange={(e) => setOrderId(e.target.value)}
         />
-        <input
-          placeholder="contraparte npub o hex"
-          value={effectiveCounterparty}
-          onChange={(e) => setCounterparty(e.target.value)}
-          style={{ width: 320 }}
-        />
+        {!solverView && (
+          <input
+            placeholder="contraparte npub o hex"
+            value={effectiveCounterparty}
+            onChange={(e) => setCounterparty(e.target.value)}
+            style={{ width: 320 }}
+          />
+        )}
         {arbiter && (
           <span style={{ fontSize: "0.8em", opacity: 0.7 }}>
             árbitro configurado: {arbiter.slice(0, 12)}…
@@ -781,7 +811,7 @@ export function TradePanel({
         </p>
       )}
 
-      {role === "seller" && (
+      {!solverView && role === "seller" && (
         <>
           <h3>Acuerdo de escrow</h3>
           <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 520 }}>
@@ -846,7 +876,7 @@ export function TradePanel({
         </>
       )}
 
-      {role === "buyer" && (
+      {!solverView && role === "buyer" && (
         <>
           <h3>Datos del comprador</h3>
           <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 520 }}>
@@ -911,6 +941,11 @@ export function TradePanel({
         <div style={{ padding: 8, border: "1px solid #8884", borderRadius: 8 }}>
           <div>
             <strong>Disputa</strong> de {disputeMsg.from.slice(0, 12)}…: {disputeMsg.payload.reason}
+          </div>
+          <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
+            {disputeMsg.payload.agreement.tradeSats.toLocaleString()} sats ·{" "}
+            {disputeMsg.payload.agreement.fiatAmount.toLocaleString()}{" "}
+            {disputeMsg.payload.agreement.fiat} · orden {effectiveOrderId.slice(0, 8)}…
           </div>
           <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
             anuncio público:{" "}

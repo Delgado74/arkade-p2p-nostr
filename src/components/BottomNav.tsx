@@ -1,19 +1,28 @@
-import { BookIcon, BoltIcon, ChatIcon } from "./icons";
+import { BookIcon, BoltIcon, ChatIcon, ShieldIcon } from "./icons";
 import { navRoot, type Screen } from "./nav";
 
 interface Props {
   active: Screen;
   chatUnread: number;
   activeOps: number;
+  solverActive: number;
+  isSolver: boolean;
   onNavigate: (screen: Screen) => void;
 }
 
 /** Mobile navigation, mirroring Mostro's Book / Trades / Chat bar. */
-export function BottomNav({ active, chatUnread, activeOps, onNavigate }: Props) {
+export function BottomNav({
+  active,
+  chatUnread,
+  activeOps,
+  solverActive,
+  isSolver,
+  onNavigate,
+}: Props) {
   const root = navRoot(active);
 
   return (
-    <nav className="bottom-nav" aria-label="Navegación">
+    <nav className="bottom-nav" data-columns={isSolver ? 4 : 3} aria-label="Navegación">
       <button
         type="button"
         className="nav-item"
@@ -49,6 +58,20 @@ export function BottomNav({ active, chatUnread, activeOps, onNavigate }: Props) 
         </span>
         Chat
       </button>
+      {isSolver && (
+        <button
+          type="button"
+          className="nav-item"
+          data-active={root === "disputes"}
+          onClick={() => onNavigate("disputes")}
+        >
+          <span className="nav-item-icon">
+            <ShieldIcon />
+            {solverActive > 0 && <span className="nav-badge">{solverActive}</span>}
+          </span>
+          Disputas
+        </button>
+      )}
     </nav>
   );
 }

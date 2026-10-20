@@ -70,6 +70,15 @@ export function ChatIcon(props: Props) {
   );
 }
 
+export function ShieldIcon(props: Props) {
+  return (
+    <Svg {...props}>
+      <path d="M12 3 5 6v6c0 4.2 3 7.4 7 9 4-1.6 7-4.8 7-9V6l-7-3Z" />
+      <path d="M12 9v4M12 16h.01" strokeWidth="2.4" />
+    </Svg>
+  );
+}
+
 export function KeyIcon(props: Props) {
   return (
     <Svg {...props}>
