@@ -8,6 +8,8 @@ import {
   assertAllowedSighashTypes,
   assertSubmittedArkTxid,
   buildOffchainTx,
+  canRecoverOnchain,
+  canSpendOffchain,
   combineTapscriptSigs,
   matchServerCheckpoints,
   toXOnly,
@@ -242,38 +244,112 @@ export function escrowScripts(escrow: Escrow): string[] {
   return [hex.encode(escrow.script.pkScript)];
 }
 
-/** Look up the (first) spendable VTXO funded into the escrow, if any. */
+/**
+ * How a VTXO funded into the escrow is currently usable.
+ *
+ * - `spendable`: settled in a batch; a cooperative release/refund/arbiter
+ *   spend can be built and submitted right now.
+ * - `pending`: still `preconfirmed` (not yet finalized in a batch). It must be
+ *   left to settle before it can be spent; operating on it now risks losing it
+ *   to a batch sweep.
+ * - `recoverable`: its batch was swept (`isSwept`), so it can no longer be
+ *   spent off-chain as-is and needs recovery before it is usable.
+ */
+export type EscrowVtxoState = "spendable" | "pending" | "recoverable";
+
+export interface EscrowVtxo {
+  vtxo: VirtualCoin;
+  state: EscrowVtxoState;
+  /** `canSpendOffchain` on the coin — true only when it can be spent now. */
+  spendable: boolean;
+  /** `canRecoverOnchain` — true when it must be recovered into a fresh batch. */
+  recoverable: boolean;
+}
+
+function classifyEscrowVtxo(vtxo: VirtualCoin): EscrowVtxo {
+  const now = { timestamp: new Date() };
+  const spendable = canSpendOffchain(vtxo, now);
+  const recoverable = canRecoverOnchain(vtxo, now);
+  const state: EscrowVtxoState = spendable
+    ? "spendable"
+    : recoverable
+      ? "recoverable"
+      : "pending";
+  return { vtxo, state, spendable, recoverable };
+}
+
+/**
+ * Every live (unspent) VTXO locked to this escrow, with its usability state.
+ *
+ * Deliberately does NOT pass `spendableOnly` and does NOT filter out `isSwept`:
+ * right after funding the escrow output is still `preconfirmed` (not yet
+ * finalized in a batch), and a swept output is still recoverable — dropping
+ * either turned a real funding into an invisible one ("I funded but it never
+ * shows up / the funds are gone"). We fetch everything for the escrow script and
+ * classify locally, matching how the SDK's own contract poll reads VTXOs.
+ */
+export async function listEscrowVtxos(
+  indexer: RestIndexerProvider,
+  escrow: Escrow,
+): Promise<EscrowVtxo[]> {
+  const { vtxos } = await indexer.getVtxos({ scripts: escrowScripts(escrow) });
+  return vtxos.filter((v) => !v.isSpent).map(classifyEscrowVtxo);
+}
+
+/**
+ * The best live VTXO funded into the escrow: the first spendable one, else the
+ * first recoverable, else the first pending. Returns `null` when the escrow has
+ * no live VTXO at all.
+ */
 export async function findEscrowVtxo(
   indexer: RestIndexerProvider,
   escrow: Escrow,
 ): Promise<VirtualCoin | null> {
-  const { vtxos } = await indexer.getVtxos({
-    scripts: escrowScripts(escrow),
-    spendableOnly: true,
-  });
-  return vtxos.find((v) => !v.isSpent && !v.isSwept) ?? null;
+  const all = await listEscrowVtxos(indexer, escrow);
+  const pick =
+    all.find((e) => e.state === "spendable") ??
+    all.find((e) => e.state === "recoverable") ??
+    all[0];
+  return pick?.vtxo ?? null;
 }
 
 /**
- * Confirm the escrow holds exactly `expectedSats`; throws otherwise.
+ * Confirm the escrow holds exactly `expectedSats` and is *spendable now*;
+ * throws otherwise with an actionable message.
  *
  * The release spend pays the buyer `tradeSats` and has no change output back to
  * the escrow, so any excess funded above the agreed amount is absorbed as fees
  * and lost. Funding must therefore match the agreed amount exactly.
+ *
+ * Also enforces the production invariant that we never operate on a VTXO that
+ * cannot be spent off-chain yet: a `preconfirmed` escrow is left to settle
+ * (blocking actions instead of risking a batch sweep), and a `swept` one is
+ * reported as recoverable rather than silently treated as missing.
  */
 export async function assertFunded(
   indexer: RestIndexerProvider,
   escrow: Escrow,
   expectedSats: number,
 ): Promise<VirtualCoin> {
-  const vtxo = await findEscrowVtxo(indexer, escrow);
-  if (!vtxo) throw new Error("escrow has no spendable VTXO");
-  if (vtxo.value !== expectedSats) {
+  const all = await listEscrowVtxos(indexer, escrow);
+  if (all.length === 0) throw new Error("escrow has no live VTXO");
+  const funded = all.find((e) => e.vtxo.value === expectedSats) ?? all[0];
+  if (funded.vtxo.value !== expectedSats) {
     throw new Error(
-      `escrow funded with ${vtxo.value} sats but the agreement is ${expectedSats} sats; send exactly the agreed amount`,
+      `escrow funded with ${funded.vtxo.value} sats but the agreement is ${expectedSats} sats; send exactly the agreed amount`,
     );
   }
-  return vtxo;
+  if (funded.state === "recoverable") {
+    throw new Error(
+      "the escrow VTXO was swept (its batch expired) and must be recovered before it can be spent",
+    );
+  }
+  if (!funded.spendable) {
+    throw new Error(
+      "the escrow is funded but not settled yet; wait for the batch to finalize before releasing, refunding or disputing",
+    );
+  }
+  return funded.vtxo;
 }
 
 function buildInput(escrow: Escrow, vtxo: VirtualCoin, path: EscrowPath): ArkTxInput {

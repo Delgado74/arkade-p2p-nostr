@@ -13,7 +13,7 @@ import {
   coSignSpend,
   EscrowPath,
   escrowFromAgreement,
-  findEscrowVtxo,
+  listEscrowVtxos,
   mergeSpends,
   outputToArkAddress,
   refundLocktimeFrom,
@@ -23,6 +23,7 @@ import {
   verifyRefundSpend,
   verifyReleaseSpend,
   type Escrow,
+  type EscrowVtxoState,
 } from "../lib/escrow";
 import {
   encodeTradeMessage,
@@ -156,6 +157,10 @@ export function TradePanel({
   const [disputeReason, setDisputeReason] = useState("");
 
   const [localVtxo, setLocalVtxo] = useState<VirtualCoin | null>(null);
+  // Usability of the locally-detected escrow VTXO: "spendable" once settled in
+  // a batch, "pending" while still preconfirmed, "recoverable" if its batch was
+  // swept. Actions that spend the escrow are gated on "spendable".
+  const [localEscrowState, setLocalEscrowState] = useState<EscrowVtxoState | null>(null);
   // Coarse clock so timelock deadlines re-render without a per-second timer.
   const [nowSec, setNowSec] = useState(() => nowSeconds());
   const [busy, setBusy] = useState(false);
@@ -296,10 +301,13 @@ export function TradePanel({
   // The buyer's payout address, from the `take` or any of the recovered sources.
   const buyerArk =
     lastOf("take")?.payload.buyerArkAddress ?? request?.buyerArkAddress ?? recoveredBuyerArk;
-  // The value in effect: whatever the user typed, else the address recovered
-  // from the feed. Prefilled on render (no effect) so reopening an operation
-  // never asks again for an address already given at creation/take time.
-  const effectiveMyArk = myArk.trim() || ownRecoveredArk;
+  // The value in effect: whatever the user typed, else the address carried on
+  // the request (order creation/take), else the one recovered from the feed.
+  // Reading it on render (no effect) means reopening an operation never asks
+  // again for an address already given at creation/take time, and a late
+  // `fetchOrder` fill-in shows up without clobbering manual typing.
+  const requestArk = (role === "seller" ? request?.refundAddress : request?.buyerArkAddress) ?? "";
+  const effectiveMyArk = myArk.trim() || requestArk.trim() || ownRecoveredArk;
 
   // True when our key is part of the escrow's committed solver set. For a
   // party the agreement comes from our own escrow DM; for a solver it arrives
@@ -372,6 +380,30 @@ export function TradePanel({
         } as unknown as VirtualCoin)
       : null);
 
+  // Whether the escrow can be spent right now. When we detected the VTXO
+  // ourselves we trust the classified state; when we only have the seller's
+  // `funded` announcement we cannot classify it, so we optimistically allow —
+  // the actual `submitSpend`/`assertFunded` call still rejects a bad VTXO.
+  const escrowSpendable = localEscrowState === null || localEscrowState === "spendable";
+  const escrowPending = localEscrowState === "pending";
+  const escrowRecoverable = localEscrowState === "recoverable";
+
+  // Refuse to spend the escrow while it is not settled. Operating on a
+  // preconfirmed VTXO risks losing it to a batch sweep; a swept one cannot be
+  // spent off-chain at all.
+  function requireSpendableEscrow(): void {
+    if (escrowRecoverable) {
+      throw new Error(
+        "el escrow quedó barrido (swept): sus fondos deben recuperarse antes de liberarse, reembolsarse o disputarse",
+      );
+    }
+    if (escrowPending) {
+      throw new Error(
+        "el escrow está fondeado pero aún no se asentó en un batch (preconfirmado); espera el asentamiento antes de liberar, reembolsar o disputar",
+      );
+    }
+  }
+
   // The release spend pays the buyer exactly `tradeSats` and has no change back
   // to the escrow, so any excess funded is lost. Funding must match exactly.
   const expectedSats = agreement?.tradeSats ?? (Number(tradeSats) > 0 ? Number(tradeSats) : null);
@@ -408,15 +440,22 @@ export function TradePanel({
 
   // Auto-check funding: poll the indexer for the escrow VTXO so neither side
   // has to press "Comprobar fondeo". The query is public (no keys involved).
+  // We keep polling while the VTXO is not yet spendable (preconfirmed or swept)
+  // so the state can flip to "spendable" once the batch settles.
   useEffect(() => {
     if (!ctx || !agreement || fundingKnown) return;
     let cancelled = false;
     const esc = escrowFromAgreement(agreement, ctx.network);
     const poll = () => {
-      findEscrowVtxo(ctx.indexer, esc)
+      listEscrowVtxos(ctx.indexer, esc)
         .then((found) => {
-          if (cancelled || !found) return;
-          setLocalVtxo(found);
+          if (cancelled || found.length === 0) return;
+          const best =
+            found.find((e) => e.state === "spendable") ??
+            found.find((e) => e.state === "recoverable") ??
+            found[0];
+          setLocalVtxo(best.vtxo);
+          setLocalEscrowState(best.state);
         })
         .catch(() => undefined);
     };
@@ -656,14 +695,32 @@ export function TradePanel({
   function checkFunding(announce: boolean) {
     if (!ctx || !escrow) throw new Error("aún no hay escrow acordado");
     run(async () => {
-      const found = await findEscrowVtxo(ctx.indexer, escrow);
+      const all = await listEscrowVtxos(ctx.indexer, escrow);
+      const best =
+        all.find((e) => e.state === "spendable") ??
+        all.find((e) => e.state === "recoverable") ??
+        all[0];
+      const found = best?.vtxo ?? null;
       setLocalVtxo(found);
+      setLocalEscrowState(best?.state ?? null);
       if (!found) throw new Error("el escrow aún no tiene fondos");
       const expected = agreement?.tradeSats ?? null;
       if (expected !== null && Number(found.value) !== expected) {
         throw new Error(
           `fondeo incorrecto: el escrow tiene ${found.value} sats pero el acuerdo es ${expected} sats; el vendedor debe enviar exactamente el monto acordado`,
         );
+      }
+      if (best.state === "recoverable") {
+        setStatus(
+          `El escrow quedó barrido (swept) con ${found.value} sats: sus fondos deben recuperarse antes de poder liberarse o reembolsarse.`,
+        );
+        return;
+      }
+      if (best.state === "pending") {
+        setStatus(
+          `Escrow fondeado con ${found.value} sats, esperando asentamiento del batch (aún preconfirmado). No liberes, reembolses ni disputes hasta que se asiente.`,
+        );
+        return;
       }
       if (announce) {
         announcedRef.current = true;
@@ -676,6 +733,7 @@ export function TradePanel({
   function handleReleaseRequest() {
     if (!identity || !ctx) throw new Error("falta identidad o ASP");
     if (!escrow || !vtxo || !agreement) throw new Error("falta escrow fondeado o acuerdo");
+    requireSpendableEscrow();
     if (fundingExact === false) {
       throw new Error(
         `el escrow está fondeado con ${fundedSats} sats pero el acuerdo es ${agreement.tradeSats} sats; debe enviarse exactamente el monto acordado`,
@@ -684,8 +742,12 @@ export function TradePanel({
     const dest = buyerArk.trim();
     if (!dest) throw new Error("falta la dirección Ark del comprador (aún no envió 'take')");
     run(async () => {
+      // Re-check against the indexer right before spending: a VTXO that looked
+      // settled locally may have been swept since, and the server rejects a
+      // recoverable input with "VTXO is recoverable".
+      const spendable = await assertFunded(ctx.indexer, escrow, agreement.tradeSats);
       const outputs = [outputToArkAddress(dest, BigInt(agreement.tradeSats))];
-      const partial = buildSpend(ctx.info, escrow, vtxo, EscrowPath.Release, outputs);
+      const partial = buildSpend(ctx.info, escrow, spendable, EscrowPath.Release, outputs);
       const signed = await signSpend(partial, identity);
       await send("release_request", { spend: signed, to: dest, sats: agreement.tradeSats });
       setStatus("Petición de liberación enviada; espera la co-firma del comprador.");
@@ -695,6 +757,7 @@ export function TradePanel({
   function handleReleaseNow() {
     if (!identity || !ctx) throw new Error("falta identidad o ASP");
     if (!escrow || !vtxo || !agreement || !pendingRelease) throw new Error("faltan datos para liberar");
+    requireSpendableEscrow();
     if (fundingExact === false) {
       throw new Error(
         `el escrow está fondeado con ${fundedSats} sats pero el acuerdo es ${agreement.tradeSats} sats; no se puede liberar hasta que el fondeo coincida exactamente`,
@@ -707,7 +770,11 @@ export function TradePanel({
       throw new Error("la liberación no paga a la dirección Ark indicada");
     }
     run(async () => {
-      verifyReleaseSpend(escrow, vtxo, { destination: dest, sats: agreement.tradeSats }, spend);
+      // Re-check against the indexer before co-signing: a VTXO that looked
+      // settled may have been swept since, and the server rejects a recoverable
+      // input with "VTXO is recoverable".
+      const spendable = await assertFunded(ctx.indexer, escrow, agreement.tradeSats);
+      verifyReleaseSpend(escrow, spendable, { destination: dest, sats: agreement.tradeSats }, spend);
       const coSigned = await coSignSpend(spend, identity);
       const both = mergeSpends(spend, coSigned);
       const arkTxid = await submitSpend(ctx.ark, both);
@@ -726,13 +793,15 @@ export function TradePanel({
     if (!escrow || !vtxo || !agreement) throw new Error("falta escrow fondeado o acuerdo");
     if (role !== "seller") throw new Error("solo el vendedor puede reclamar el reembolso");
     if (!refundMature) throw new Error("el reembolso aún no está disponible (plazo sin vencer)");
+    requireSpendableEscrow();
     const dest = effectiveMyArk || recoveredSellerArk;
     if (!dest) throw new Error("falta tu dirección Ark de cobro");
     run(async () => {
+      const spendable = await assertFunded(ctx.indexer, escrow, agreement.tradeSats);
       const outputs = [outputToArkAddress(dest, BigInt(agreement.tradeSats))];
-      const partial = buildSpend(ctx.info, escrow, vtxo, EscrowPath.Refund, outputs);
+      const partial = buildSpend(ctx.info, escrow, spendable, EscrowPath.Refund, outputs);
       const signed = await signSpend(partial, identity);
-      verifyRefundSpend(escrow, vtxo, { destination: dest, sats: agreement.tradeSats }, signed);
+      verifyRefundSpend(escrow, spendable, { destination: dest, sats: agreement.tradeSats }, signed);
       const arkTxid = await submitSpend(ctx.ark, signed);
       await sendTo(agreement.buyerPubKey, "arbiter_decision", {
         outcome: "refund_to_seller",
@@ -994,14 +1063,16 @@ export function TradePanel({
             </button>
             <button
               type="button"
-              disabled={busy || !vtxo || !buyerArk || fundingExact === false}
+              disabled={busy || !vtxo || !buyerArk || fundingExact === false || !escrowSpendable}
               onClick={handleReleaseRequest}
             >
               Solicitar liberación (firmar y enviar)
             </button>
             <button
               type="button"
-              disabled={busy || !vtxo || !refundMature || releaseDone !== null}
+              disabled={
+                busy || !vtxo || !refundMature || releaseDone !== null || !escrowSpendable
+              }
               title={
                 refundMature
                   ? undefined
@@ -1014,6 +1085,18 @@ export function TradePanel({
               Reclamar reembolso tras el plazo
             </button>
           </div>
+          {vtxo && escrowPending && (
+            <p className="panel-note" style={{ fontSize: "0.85em", opacity: 0.9 }}>
+              Escrow fondeado pero aún <strong>no asentado</strong> en un batch (preconfirmado). Las
+              acciones de liberación, reembolso y disputa se habilitan cuando se asiente.
+            </p>
+          )}
+          {vtxo && escrowRecoverable && (
+            <p className="panel-note" style={{ fontSize: "0.85em", opacity: 0.9 }}>
+              El escrow quedó <strong>barrido (swept)</strong>: sus fondos deben recuperarse antes de
+              poder liberarse, reembolsarse o disputarse.
+            </p>
+          )}
           {vtxo && escrow && !refundMature && releaseDone === null && (
             <p className="panel-note" style={{ fontSize: "0.85em", opacity: 0.8 }}>
               Protección del vendedor: si el comprador no libera ni abre disputa, podrás reclamar el
@@ -1071,7 +1154,14 @@ export function TradePanel({
             </button>
             <button
               type="button"
-              disabled={busy || !pendingRelease || !escrow || !vtxo || fundingExact === false}
+              disabled={
+                busy ||
+                !pendingRelease ||
+                !escrow ||
+                !vtxo ||
+                fundingExact === false ||
+                !escrowSpendable
+              }
               onClick={handleReleaseNow}
             >
               Verificar, firmar y liberar
@@ -1098,7 +1188,13 @@ export function TradePanel({
           <div>
             <button
               type="button"
-              disabled={busy || !identity || !agreement || agreement.arbiterPubKeys.length === 0}
+              disabled={
+                busy ||
+                !identity ||
+                !agreement ||
+                agreement.arbiterPubKeys.length === 0 ||
+                !escrowSpendable
+              }
               onClick={handleOpenDispute}
             >
               Abrir disputa (a los solvers)

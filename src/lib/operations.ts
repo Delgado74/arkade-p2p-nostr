@@ -27,6 +27,10 @@ export interface OperationRecord {
   status: OperationStatus;
   createdAt: number;
   updatedAt: number;
+  /** Seller's Ark refund address, carried over from the order/escrow. */
+  refundAddress?: string;
+  /** Buyer's Ark payout address, carried over from the order/take. */
+  buyerArkAddress?: string;
 }
 
 /** True when the operation is no longer live (finished or aborted). */
@@ -111,6 +115,8 @@ export function recordOperation(
     status: patch.status ?? existing?.status ?? "in-progress",
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
+    refundAddress: patch.refundAddress ?? existing?.refundAddress,
+    buyerArkAddress: patch.buyerArkAddress ?? existing?.buyerArkAddress,
   };
   const next = [merged, ...list.filter((op) => op.orderId !== orderId)];
   persist(pubkey, next);

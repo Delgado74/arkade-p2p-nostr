@@ -180,6 +180,7 @@ export default function App() {
             role: makerRole,
             counterparty: dm.sender,
             status: "in-progress",
+            buyerArkAddress: msg.payload.buyerArkAddress,
           });
           // Best effort: enrich the panel and history with the order details.
           void client
@@ -205,6 +206,8 @@ export default function App() {
                 fiatAmount: order.fiatAmount,
                 tradeSats: order.amountSats,
                 status: "in-progress",
+                refundAddress: order.arkRefundAddress,
+                buyerArkAddress: msg.payload.buyerArkAddress,
               });
             })
             .catch(() => undefined);
@@ -434,6 +437,8 @@ export default function App() {
       fiatAmount: order.fiatAmount,
       tradeSats: order.amountSats,
       status: "in-progress",
+      refundAddress: order.arkRefundAddress,
+      buyerArkAddress: receiveAddr,
     });
     navigate("trade");
   }
@@ -441,6 +446,8 @@ export default function App() {
   function openOperation(orderId: string) {
     const op = operations.find((entry) => entry.orderId === orderId);
     if (!op) return;
+    // Restore the addresses captured when the order was created or taken, so
+    // reopening never asks again for one the user already provided.
     setTradeRequest({
       orderId: op.orderId,
       counterparty: op.counterparty,
@@ -448,6 +455,8 @@ export default function App() {
       fiat: op.fiat,
       fiatAmount: op.fiatAmount,
       tradeSats: op.tradeSats,
+      refundAddress: op.refundAddress,
+      buyerArkAddress: op.buyerArkAddress,
     });
     navigate("trade");
   }
