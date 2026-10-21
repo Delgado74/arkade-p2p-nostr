@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { connectArkade, type ArkContext } from "./lib/arkade";
 import { generateIdentity, identityFromInput, type Identity } from "./lib/identity";
@@ -108,11 +108,28 @@ export default function App() {
 
   const client = nostrClient();
 
+  // DM ids already fed through the side-effect handlers. A reload refetches up
+  // to 30 days of history, so without this every old `take` would re-run and
+  // drag a finished trade back to `in-progress`.
+  const processedDms = useRef<Set<string>>(new Set());
+
   const record = useCallback(
     (orderId: string, patch: Partial<OperationRecord>) => {
       setOperations(recordOperation(identity.pubkeyHex, orderId, patch));
     },
     [identity.pubkeyHex],
+  );
+
+  // Like `record`, but refuses to reopen a trade that already finished: a
+  // re-delivered `take` (or any late "in-progress" signal) must never drag a
+  // completed/canceled operation back onto the Operación screen.
+  const recordActive = useCallback(
+    (orderId: string, patch: Partial<OperationRecord>) => {
+      const existing = loadOperations(identity.pubkeyHex).find((op) => op.orderId === orderId);
+      if (existing && isFinished(existing.status)) return;
+      record(orderId, patch);
+    },
+    [identity.pubkeyHex, record],
   );
 
   // Auto-connect to the ASP on load. State is only updated from the promise
@@ -142,6 +159,10 @@ export default function App() {
           prev.some((entry) => entry.dm.id === dm.id) ? prev : [...prev, { dm, msg }],
         );
         if (!msg) return;
+        // Side effects run once per DM. Re-delivered history (reloads refetch
+        // weeks of messages) must not re-fire them.
+        if (processedDms.current.has(dm.id)) return;
+        processedDms.current.add(dm.id);
         // A `take` is only meaningful to its recipient (the maker); the taker
         // already opened their panel when they pressed "Tomar".
         if (msg.type === "take" && !dm.outgoing) {
@@ -155,7 +176,7 @@ export default function App() {
             role: makerRole,
             buyerArkAddress: msg.payload.buyerArkAddress,
           });
-          record(msg.orderId, {
+          recordActive(msg.orderId, {
             role: makerRole,
             counterparty: dm.sender,
             status: "in-progress",
@@ -177,7 +198,7 @@ export default function App() {
                     }
                   : prev,
               );
-              record(msg.orderId, {
+              recordActive(msg.orderId, {
                 role: makerRole,
                 counterparty: dm.sender,
                 fiat: order.fiat,
@@ -212,7 +233,7 @@ export default function App() {
       },
     });
     return () => subscription.close();
-  }, [identity, client, record]);
+  }, [identity, client, record, recordActive]);
 
   // Live public dispute feed: announcements (who opened) and takes (who is
   // resolving). Both are needed to show dispute state without a manual reload.
