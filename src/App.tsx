@@ -27,6 +27,7 @@ import { isFinished, loadOperations, recordOperation, type OperationRecord } fro
 import {
   buildConversations,
   buildDisputeRooms,
+  isOurTradeConversation,
   loadReadMarks,
   saveReadMarks,
   type ReadMarks,
@@ -282,9 +283,17 @@ export default function App() {
       ),
     [feed, disputeAnnounces, disputeTakes, disputeResolutions, identity.pubkeyHex, readMarks],
   );
+  // Mirror exactly what the Chat screen lists: our own trades (not a solver's
+  // broadcast traffic) plus every dispute room, so the badge never shows a
+  // count with no visible room behind it.
   const chatUnread =
-    conversations.reduce((sum, c) => (c.disputeOnly ? sum : sum + c.unread), 0) +
-    disputeRooms.reduce((sum, d) => sum + d.unread, 0);
+    conversations.reduce(
+      (sum, c) =>
+        !c.disputeOnly && isOurTradeConversation(c, feed, operations, identity.pubkeyHex)
+          ? sum + c.unread
+          : sum,
+      0,
+    ) + disputeRooms.reduce((sum, d) => sum + d.unread, 0);
   const activeOps = operations.filter((op) => !isFinished(op.status)).length;
   // Only keys published in the coordinator's registry may act as solvers. The
   // Disputas screen is hidden for everyone else; there is no self opt-in.

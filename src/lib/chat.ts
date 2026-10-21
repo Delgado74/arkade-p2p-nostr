@@ -1,5 +1,6 @@
 import type { DirectMessage } from "./dm";
 import type { TradeDm } from "./trade";
+import type { OperationRecord } from "./operations";
 import {
   pickDisputeTakeTaker,
   type DisputeAnnounce,
@@ -167,6 +168,54 @@ export function buildConversations(
     const bt = b.messages[b.messages.length - 1]?.ts ?? 0;
     return bt - at;
   });
+}
+
+/**
+ * The latest escrow/dispute agreement seen for an order in the feed.
+ *
+ * Carries the buyer/seller/arbiter keys, which tell parties apart from solvers
+ * who merely received a copy of the agreement.
+ */
+export function agreementFor(orderId: string, feed: TradeDm[]) {
+  for (let i = feed.length - 1; i >= 0; i--) {
+    const msg = feed[i].msg;
+    if (!msg || msg.orderId !== orderId) continue;
+    if (msg.type === "escrow" || msg.type === "dispute") return msg.payload.agreement;
+  }
+  return null;
+}
+
+/**
+ * True when a conversation is one of OUR OWN trades: either we hold an
+ * operation record for its order, or the latest agreement for that order lists
+ * us as the buyer or seller. A solver who merely received a broadcast
+ * (`ark_address`/`escrow`) is not in the agreement's party keys, so those rooms
+ * are excluded. Free DMs (no order) are always ours.
+ */
+export function isOurTradeConversation(
+  conv: Conversation,
+  feed: TradeDm[],
+  operations: OperationRecord[],
+  myPubKey: string,
+): boolean {
+  if (!conv.orderId) return true;
+  if (operations.some((o) => o.orderId === conv.orderId)) return true;
+  const me = myPubKey.toLowerCase();
+  const agreement = agreementFor(conv.orderId, feed);
+  if (agreement) {
+    return (
+      agreement.buyerPubKey.toLowerCase() === me || agreement.sellerPubKey.toLowerCase() === me
+    );
+  }
+  // No agreement seen yet (e.g. just after a `take`): treat it as ours if we
+  // have spoken on that order, or we received a `take`/`escrow` addressed to us.
+  for (let i = feed.length - 1; i >= 0; i--) {
+    const entry = feed[i];
+    if (entry.msg?.orderId !== conv.orderId) continue;
+    if (entry.dm.outgoing) return true;
+    if (entry.msg.type === "take" || entry.msg.type === "escrow") return true;
+  }
+  return false;
 }
 
 /**

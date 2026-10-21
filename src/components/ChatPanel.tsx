@@ -19,8 +19,10 @@ import {
 } from "../lib/protocol";
 import { isFinished, statusLabel, type OperationRecord } from "../lib/operations";
 import {
+  agreementFor,
   buildConversations,
   buildDisputeRooms,
+  isOurTradeConversation,
   peerOf,
   previewOf,
   timeLabel,
@@ -106,16 +108,6 @@ function orderPeers(orderId: string, feed: TradeDm[], myPubKey: string): string[
     if (peer.toLowerCase() !== myPubKey.toLowerCase()) peers.add(peer);
   }
   return [...peers];
-}
-
-/** Last escrow/dispute agreement seen for an order (carries the solver set). */
-function agreementFor(orderId: string, feed: TradeDm[]) {
-  for (let i = feed.length - 1; i >= 0; i--) {
-    const msg = feed[i].msg;
-    if (!msg || msg.orderId !== orderId) continue;
-    if (msg.type === "escrow" || msg.type === "dispute") return msg.payload.agreement;
-  }
-  return null;
 }
 
 /**
@@ -205,8 +197,12 @@ export function ChatPanel({
     [feed, disputeAnnounces, disputeTakes, disputeResolutions, identity.pubkeyHex, readMarks],
   );
 
+  // Mensajes shows only our own trades. Dispute-scope rooms live under Disputas,
+  // and a solver's broadcast traffic (`ark_address`/`escrow` for orders it only
+  // arbitrates) is excluded by `isOurTradeConversation`, so a solver sees
+  // nothing here except chats of operations they are actually a party to.
   const messageConvs = conversations.filter(
-    (c) => !c.orderId || operations.some((o) => o.orderId === c.orderId),
+    (c) => !c.disputeOnly && isOurTradeConversation(c, feed, operations, identity.pubkeyHex),
   );
 
   // While a room is open its own badge stays at zero without touching storage.
