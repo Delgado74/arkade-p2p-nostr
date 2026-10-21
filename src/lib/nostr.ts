@@ -28,11 +28,20 @@ import type { Identity } from "./identity";
 /** NIP-09 event kind used to request deletion of an order. */
 export const DELETION_KIND = 5;
 
-/** Relays used when `VITE_RELAYS` is not set. */
+/**
+ * Relays used when `VITE_RELAYS` is not set.
+ *
+ * A broad set matters: peers only exchange DMs over relays that BOTH can reach,
+ * so a single dead relay must not silently cut a trade off. `relay.nostr.band`
+ * was removed after repeated connection failures.
+ */
 export const DEFAULT_RELAYS = [
   "wss://relay.damus.io",
   "wss://nos.lol",
-  "wss://relay.nostr.band",
+  "wss://relay.primal.net",
+  "wss://nostr.mom",
+  "wss://offchain.pub",
+  "wss://nostr-pub.wellorder.net",
 ];
 
 /** Read the relay list from `VITE_RELAYS`, falling back to defaults. */
