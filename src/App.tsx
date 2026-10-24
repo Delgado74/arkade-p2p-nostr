@@ -22,7 +22,9 @@ import type {
   OrderType,
   SolverRegistry,
 } from "./lib/protocol";
+import { buildOrderTemplate } from "./lib/protocol";
 import { coordinatorPubKey } from "./lib/config";
+import { computeWindowState } from "./lib/windows";
 import { isFinished, loadOperations, recordOperation, type OperationRecord } from "./lib/operations";
 import {
   buildConversations,
@@ -32,7 +34,7 @@ import {
   saveReadMarks,
   type ReadMarks,
 } from "./lib/chat";
-import { RatesPanel } from "./components/RatesPanel";
+// import { RatesPanel } from "./components/RatesPanel";
 import { OrderForm } from "./components/OrderForm";
 import { OrderBook } from "./components/OrderBook";
 import { EscrowHarness } from "./components/EscrowHarness";
@@ -41,7 +43,7 @@ import { TradePanel, type TradeRequest } from "./components/TradePanel";
 import { ChatPanel } from "./components/ChatPanel";
 import { SolverInbox } from "./components/SolverInbox";
 import { activeSolverDisputes, buildSolverDisputes, isListedSolver } from "./lib/solver";
-import { usePeerLabels } from "./lib/useNyms";
+import { usePeerLabels, type NymRef } from "./lib/useNyms";
 import { Sidebar } from "./components/Sidebar";
 import { BottomNav } from "./components/BottomNav";
 import { AddOrderButton } from "./components/AddOrderButton";
@@ -68,7 +70,7 @@ const SCREEN_META: Record<Screen, { title: string; sub: string }> = {
   chat: { title: "Chat", sub: "Mensajes y disputas" },
   disputes: { title: "Disputas", sub: "Solicitudes donde tu clave es solver" },
   account: { title: "Cuenta y claves", sub: "Identidad Nostr/Arkade y conexión con el ASP" },
-  rates: { title: "Tasas", sub: "Precio de referencia y prima" },
+  rates: { title: "Tasas", sub: "Precio de referencia y prima" }, // deprecated
   escrow: { title: "Escrow (pruebas)", sub: "Banco de pruebas del escrow Arkade" },
 };
 
@@ -79,6 +81,8 @@ const BACK_TARGET: Partial<Record<Screen, Screen>> = {
 
 export default function App() {
   const [tab, setTab] = useState<Screen>("book");
+  // Order whose chat conversation is opened on the chat screen.
+  const [focusOrderId, setFocusOrderId] = useState<string | null>(null);
   const [createType, setCreateType] = useState<OrderType>("sell");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [identity, setIdentity] = useState<Identity>(loadOrCreateIdentity);
@@ -87,6 +91,7 @@ export default function App() {
   const [aspStatus, setAspStatus] = useState<AspStatus>("connecting");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [status, setStatus] = useState("");
   const [feed, setFeed] = useState<TradeDm[]>([]);
   const [tradeRequest, setTradeRequest] = useState<TradeRequest | null>(null);
   const [operations, setOperations] = useState<OperationRecord[]>(() =>
@@ -116,6 +121,11 @@ export default function App() {
   const record = useCallback(
     (orderId: string, patch: Partial<OperationRecord>) => {
       setOperations(recordOperation(identity.pubkeyHex, orderId, patch));
+      // A finished operation wipes its private thread: the chat leaves no
+      // trace in this session, neither in the feed nor in the badge.
+      if (patch.status && isFinished(patch.status)) {
+        setFeed((prev) => prev.filter((entry) => entry.msg?.orderId !== orderId));
+      }
     },
     [identity.pubkeyHex],
   );
@@ -123,13 +133,31 @@ export default function App() {
   // Like `record`, but refuses to reopen a trade that already finished: a
   // re-delivered `take` (or any late "in-progress" signal) must never drag a
   // completed/canceled operation back onto the Operación screen.
-  const recordActive = useCallback(
-    (orderId: string, patch: Partial<OperationRecord>) => {
+  const recordActive = useCallback(    (orderId: string, patch: Partial<OperationRecord>) => {
       const existing = loadOperations(identity.pubkeyHex).find((op) => op.orderId === orderId);
       if (existing && isFinished(existing.status)) return;
       record(orderId, patch);
     },
     [identity.pubkeyHex, record],
+  );
+
+  // Persist a patch on the operation currently open in the trade panel (the
+  // Ark address the user typed when opening the operation, for instance).
+  const recordCurrent = useCallback(
+    (patch: Partial<OperationRecord>) => {
+      if (!tradeRequest) return;
+      record(tradeRequest.orderId, patch);
+    },
+    [record, tradeRequest],
+  );
+
+  // Record the stars the local identity left for a counterparty, so the rating
+  // prompt in "Mis operaciones" disappears after a successful publish.
+  const rateCounterparty = useCallback(
+    (orderId: string, value: number) => {
+      record(orderId, { myRating: value });
+    },
+    [record],
   );
 
   // Auto-connect to the ASP on load. State is only updated from the promise
@@ -170,17 +198,28 @@ export default function App() {
           // We are the maker. The taker's role is in the message, so the maker
           // plays the opposite side without needing to fetch the order first.
           const makerRole: TradeRole = msg.role === "buyer" ? "seller" : "buyer";
+          // A modern take carries the address in the `take` payload; a legacy
+          // `taker_address` DM may still arrive and is accepted for compatibility.
+          const inlineTakerAddr = msg.payload.buyerArkAddress?.trim() || undefined;
           setTradeRequest({
             orderId: msg.orderId,
             counterparty: dm.sender,
             role: makerRole,
-            buyerArkAddress: msg.payload.buyerArkAddress,
+            takerArkAddress: inlineTakerAddr,
+            buyerArkAddress: makerRole === "buyer" ? undefined : inlineTakerAddr,
+            refundAddress: makerRole === "seller" ? undefined : inlineTakerAddr,
+            maker: true,
           });
           recordActive(msg.orderId, {
             role: makerRole,
             counterparty: dm.sender,
             status: "in-progress",
-            buyerArkAddress: msg.payload.buyerArkAddress,
+            maker: true,
+            ...(inlineTakerAddr
+              ? makerRole === "seller"
+                ? { buyerArkAddress: inlineTakerAddr }
+                : { refundAddress: inlineTakerAddr }
+              : {}),
           });
           // Best effort: enrich the panel and history with the order details.
           void client
@@ -195,7 +234,16 @@ export default function App() {
                       fiatAmount: order.fiatAmount,
                       tradeSats: order.amountSats,
                       paymentMethods: order.paymentMethods,
-                      refundAddress: order.arkRefundAddress,
+                      // The maker's own address, published with the order.
+                      arkAddress: order.arkAddress,
+                      buyerArkAddress:
+                        makerRole === "buyer"
+                          ? (order.arkAddress ?? prev.buyerArkAddress)
+                          : prev.buyerArkAddress,
+                      refundAddress:
+                        makerRole === "seller"
+                          ? (order.arkAddress ?? prev.refundAddress)
+                          : prev.refundAddress,
                     }
                   : prev,
               );
@@ -206,11 +254,42 @@ export default function App() {
                 fiatAmount: order.fiatAmount,
                 tradeSats: order.amountSats,
                 status: "in-progress",
-                refundAddress: order.arkRefundAddress,
-                buyerArkAddress: msg.payload.buyerArkAddress,
+                maker: true,
+                orderType: order.type,
+                // The taker's address (legacy inline) belongs to the taker; the
+                // maker's own address was published with the order.
+                ...(makerRole === "seller"
+                  ? {
+                      ...(inlineTakerAddr ? { buyerArkAddress: inlineTakerAddr } : {}),
+                      refundAddress: order.arkAddress,
+                    }
+                  : {
+                      ...(inlineTakerAddr ? { refundAddress: inlineTakerAddr } : {}),
+                      buyerArkAddress: order.arkAddress,
+                    }),
+                makerArkAddress: order.arkAddress,
+                orderEventId: order.event.id,
               });
             })
             .catch(() => undefined);
+        }
+        // Legacy `taker_address` DM: accept for compatibility (protocol messages
+        // are not rendered as peer chat). The preferred path is the address in `take`.
+        if (msg.type === "taker_address" && !dm.outgoing) {
+          const addr = msg.payload.arkAddress.trim();
+          const takerRole: TradeRole = msg.role;
+          setTradeRequest((prev) =>
+            prev && prev.orderId === msg.orderId
+              ? {
+                  ...prev,
+                  takerArkAddress: addr,
+                  ...(takerRole === "buyer"
+                    ? { buyerArkAddress: addr }
+                    : { refundAddress: addr }),
+                }
+              : prev,
+          );
+          record(msg.orderId, takerRole === "buyer" ? { buyerArkAddress: addr } : { refundAddress: addr });
         }
         // Terminal states are recorded whichever side sends them, so both the
         // maker and the taker move the trade from Operación to Historial.
@@ -237,6 +316,58 @@ export default function App() {
     });
     return () => subscription.close();
   }, [identity, client, record, recordActive]);
+
+  // Auto-republish: when the *taker* blew its 15-minute window on one of our
+  // orders, the maker did nothing wrong, so we republish the offer on its
+  // behalf as soon as we are online (only the maker can sign its own order, so
+  // this happens on reopen, not while offline). A maker at fault is never
+  // auto-republished: it must own its mistake and do it by hand.
+  const autoRepublished = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!identity) return;
+    for (const op of operations) {
+      if (op.status !== "in-progress" || op.maker !== true) continue;
+      if (autoRepublished.current.has(op.orderId)) continue;
+      if (!op.fiat || op.fiatAmount === undefined || op.tradeSats === undefined) continue;
+      if (!op.makerArkAddress) continue;
+      const funded = feed.some(
+        (e) => e.msg?.orderId === op.orderId && e.msg.type === "funded",
+      );
+      if (funded) continue;
+      const win = computeWindowState({
+        feed,
+        orderId: op.orderId,
+        role: op.role,
+        isMaker: true,
+        funded: false,
+        now: Math.floor(Date.now() / 1000),
+      });
+      if (win.culprit !== "taker") continue;
+      autoRepublished.current.add(op.orderId);
+      void client.setOrderStatus(identity, op.orderId, "canceled").catch(() => undefined);
+      const template = buildOrderTemplate({
+        type: op.orderType ?? "sell",
+        fiat: op.fiat,
+        fiatAmount: op.fiatAmount,
+        amountSats: op.tradeSats,
+        premium: 0,
+        paymentMethods: [],
+        expiresAt: Math.floor(Date.now() / 1000) + 24 * 3600,
+        name: identity.npub,
+        arkAddress: op.makerArkAddress,
+      });
+      client
+        .publish(template, identity)
+        .then((event) => {
+          const id = event.tags.find((t) => t[0] === "d")?.[1] ?? event.id;
+          record(op.orderId, { status: "canceled" });
+          setStatus(`Orden ${op.orderId.slice(0, 8)}… republicada automáticamente como ${id.slice(0, 8)}…`);
+        })
+        .catch(() => {
+          autoRepublished.current.delete(op.orderId);
+        });
+    }
+  }, [operations, feed, identity, client, record]);
 
   // Live public dispute feed: announcements (who opened) and takes (who is
   // resolving). Both are needed to show dispute state without a manual reload.
@@ -289,23 +420,46 @@ export default function App() {
     };
   }, [client]);
 
+  // Orders whose operation reached a terminal state. Their private chats are
+  // wiped: the DMs stop being shown and stop counting as unread, so the peers
+  // do not keep a channel open after the trade is over.
+  const finishedOrderIds = useMemo(
+    () => new Set(operations.filter((op) => isFinished(op.status)).map((op) => op.orderId)),
+    [operations],
+  );
+
+  // The feed the UI is allowed to see. NIP-17 DMs live on the relays, so a
+  // reload brings the history back; filtering here is what actually makes a
+  // finished operation's chat disappear instead of merely hiding it.
+  const visibleFeed = useMemo(
+    () => feed.filter((entry) => !entry.msg?.orderId || !finishedOrderIds.has(entry.msg.orderId)),
+    [feed, finishedOrderIds],
+  );
+
   // Badges for the menu and the bottom bar. Read marks live here so both
   // surfaces stay in sync with the chat screen.
   const conversations = useMemo(
-    () => buildConversations(feed, identity.pubkeyHex, readMarks),
-    [feed, identity.pubkeyHex, readMarks],
+    () => buildConversations(visibleFeed, identity.pubkeyHex, readMarks),
+    [visibleFeed, identity.pubkeyHex, readMarks],
   );
   const disputeRooms = useMemo(
     () =>
       buildDisputeRooms(
-        feed,
+        visibleFeed,
         disputeAnnounces,
         disputeTakes,
         disputeResolutions,
         identity.pubkeyHex,
         readMarks,
       ),
-    [feed, disputeAnnounces, disputeTakes, disputeResolutions, identity.pubkeyHex, readMarks],
+    [
+      visibleFeed,
+      disputeAnnounces,
+      disputeTakes,
+      disputeResolutions,
+      identity.pubkeyHex,
+      readMarks,
+    ],
   );
   // Mirror exactly what the Chat screen lists: our own trades (not a solver's
   // broadcast traffic) plus every dispute room, so the badge never shows a
@@ -313,7 +467,7 @@ export default function App() {
   const chatUnread =
     conversations.reduce(
       (sum, c) =>
-        !c.disputeOnly && isOurTradeConversation(c, feed, operations, identity.pubkeyHex)
+        !c.disputeOnly && isOurTradeConversation(c, visibleFeed, operations, identity.pubkeyHex)
           ? sum + c.unread
           : sum,
       0,
@@ -325,27 +479,35 @@ export default function App() {
   const solverDisputes = useMemo(
     () =>
       isSolver
-        ? buildSolverDisputes(feed, disputeTakes, disputeResolutions, identity.pubkeyHex)
+        ? buildSolverDisputes(visibleFeed, disputeTakes, disputeResolutions, identity.pubkeyHex)
         : [],
-    [isSolver, feed, disputeTakes, disputeResolutions, identity.pubkeyHex],
+    [isSolver, visibleFeed, disputeTakes, disputeResolutions, identity.pubkeyHex],
   );
   const solverActive = activeSolverDisputes(solverDisputes);
 
-  // Every pubkey the UI may render, so their deterministic pseudonyms can be
-  // derived locally and shown instead of raw keys.
-  const peerKeys = useMemo(() => {
-    const keys: string[] = [];
-    for (const entry of feed) {
-      keys.push(entry.dm.sender, ...entry.dm.recipients);
+  // Every pubkey the UI may render, paired with the operation that scopes its
+  // alias. The same peer reads differently in each operation, so the pair is
+  // what gets derived, never the bare key.
+  const nymRefs = useMemo(() => {
+    const refs: NymRef[] = [];
+    for (const entry of visibleFeed) {
+      const orderId = entry.msg?.orderId;
+      for (const key of [entry.dm.sender, ...entry.dm.recipients]) {
+        refs.push({ pubkey: key, orderId });
+      }
     }
-    for (const d of disputeAnnounces) keys.push(d.initiator);
-    for (const t of disputeTakes) keys.push(t.solverPubKey);
-    for (const r of disputeResolutions) keys.push(r.solverPubKey);
-    for (const op of operations) keys.push(op.counterparty);
-    if (solverRegistry) keys.push(...solverRegistry.solvers);
-    return keys;
-  }, [feed, disputeAnnounces, disputeTakes, disputeResolutions, operations, solverRegistry]);
-  const label = usePeerLabels(peerKeys);
+    for (const d of disputeAnnounces) refs.push({ pubkey: d.initiator, orderId: d.orderId });
+    for (const t of disputeTakes) refs.push({ pubkey: t.solverPubKey, orderId: t.orderId });
+    for (const r of disputeResolutions) {
+      refs.push({ pubkey: r.solverPubKey, orderId: r.orderId });
+    }
+    for (const op of operations) refs.push({ pubkey: op.counterparty, orderId: op.orderId });
+    if (solverRegistry) {
+      for (const solver of solverRegistry.solvers) refs.push({ pubkey: solver });
+    }
+    return refs;
+  }, [visibleFeed, disputeAnnounces, disputeTakes, disputeResolutions, operations, solverRegistry]);
+  const label = usePeerLabels(nymRefs);
 
   function navigate(screen: Screen) {
     setSidebarOpen(false);
@@ -355,6 +517,13 @@ export default function App() {
   function openCreate(type: OrderType) {
     setCreateType(type);
     navigate("create");
+  }
+
+  // Jump to the private chat of an operation (e.g. to agree on the concrete
+  // payment method details once the escrow is funded).
+  function openChatForOrder(orderId: string) {
+    setFocusOrderId(orderId);
+    navigate("chat");
   }
 
   function applyReadMarks(next: ReadMarks) {
@@ -398,14 +567,14 @@ export default function App() {
       return;
     }
     const role = takerRole(order);
-    // For a buy order the taker is the seller, so the buyer's receive address
-    // comes from the order itself; for a sell order the taker (buyer) provides
-    // it directly.
-    const receiveAddr =
-      role === "buyer" ? (buyerArkAddress ?? "") : (order.arkReceiveAddress ?? "");
+    // The taker states the Ark address it uses in this operation: its payout
+    // address when it buys, its refund address when it sells. Include it on the
+    // `take` so the maker can build the escrow; protocol messages are never
+    // rendered as peer conversations.
+    const receiveAddr = buyerArkAddress ?? "";
     setError("");
     try {
-      const msg: TradeMessageOf<"take"> = {
+      const take: TradeMessageOf<"take"> = {
         app: TRADE_APP,
         v: TRADE_VERSION,
         type: "take",
@@ -413,9 +582,9 @@ export default function App() {
         role,
         from: identity.pubkeyHex,
         ts: Math.floor(Date.now() / 1000),
-        payload: { buyerArkAddress: receiveAddr },
+        payload: { buyerArkAddress: receiveAddr || undefined },
       };
-      await sendDm(client.pool, client.relays, identity, order.maker, encodeTradeMessage(msg));
+      await sendDm(client.pool, client.relays, identity, order.maker, encodeTradeMessage(take));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -427,8 +596,12 @@ export default function App() {
       fiatAmount: order.fiatAmount,
       tradeSats: order.amountSats,
       paymentMethods: order.paymentMethods,
-      refundAddress: order.arkRefundAddress,
-      buyerArkAddress: receiveAddr,
+      arkAddress: order.arkAddress,
+      takerArkAddress: receiveAddr,
+      buyerArkAddress: role === "buyer" ? receiveAddr : order.arkAddress,
+      refundAddress: role === "seller" ? receiveAddr : order.arkAddress,
+      maker: false,
+      orderType: order.type,
     });
     record(order.id, {
       role,
@@ -437,8 +610,12 @@ export default function App() {
       fiatAmount: order.fiatAmount,
       tradeSats: order.amountSats,
       status: "in-progress",
-      refundAddress: order.arkRefundAddress,
-      buyerArkAddress: receiveAddr,
+      maker: false,
+      orderType: order.type,
+      makerArkAddress: order.arkAddress,
+      buyerArkAddress: role === "buyer" ? receiveAddr : order.arkAddress,
+      refundAddress: role === "seller" ? receiveAddr : order.arkAddress,
+      orderEventId: order.event.id,
     });
     navigate("trade");
   }
@@ -455,8 +632,11 @@ export default function App() {
       fiat: op.fiat,
       fiatAmount: op.fiatAmount,
       tradeSats: op.tradeSats,
-      refundAddress: op.refundAddress,
+      arkAddress: op.makerArkAddress,
       buyerArkAddress: op.buyerArkAddress,
+      refundAddress: op.refundAddress,
+      maker: op.maker,
+      orderType: op.orderType,
     });
     navigate("trade");
   }
@@ -542,6 +722,7 @@ export default function App() {
 
         <div className="content">
           {error && <p className="alert">Error: {error}</p>}
+          {status && <p className="notice">{status}</p>}
 
           {screen === "book" && (
             <OrderBook
@@ -567,7 +748,14 @@ export default function App() {
           )}
 
           {screen === "trades" && (
-            <OperationsPanel operations={operations} onOpen={openOperation} label={label} />
+            <OperationsPanel
+              operations={operations}
+              onOpen={openOperation}
+              label={label}
+              client={client}
+              identity={identity}
+              onRate={rateCounterparty}
+            />
           )}
 
           {screen === "trade" &&
@@ -598,10 +786,12 @@ export default function App() {
                 ctx={ctx}
                 client={client}
                 request={tradeRequest}
-                feed={feed}
+                feed={visibleFeed}
                 disputeAnnounces={disputeAnnounces}
                 disputeTakes={disputeTakes}
                 label={label}
+                onRecord={recordCurrent}
+                onOpenChat={openChatForOrder}
               />
             ))}
 
@@ -616,13 +806,14 @@ export default function App() {
             <ChatPanel
               identity={identity}
               client={client}
-              feed={feed}
+              feed={visibleFeed}
               disputeAnnounces={disputeAnnounces}
               disputeTakes={disputeTakes}
               disputeResolutions={disputeResolutions}
               operations={operations}
               readMarks={readMarks}
               onReadMarksChange={applyReadMarks}
+              focusOrderId={focusOrderId}
               label={label}
             />
           )}
@@ -694,7 +885,7 @@ export default function App() {
             </section>
           )}
 
-          {screen === "rates" && <RatesPanel />}
+          {screen === "rates" && null}
           {screen === "escrow" && <EscrowHarness identity={identity} ctx={ctx} />}
         </div>
 

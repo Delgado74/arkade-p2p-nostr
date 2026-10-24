@@ -30,7 +30,8 @@ function resolutionLabel(status: string | undefined): string {
 
 /** Solver inbox: disputes whose escrow commits our key to the solver set. */
 export function SolverInbox({ disputes, onOpen, label }: Props) {
-  const peer = (pubkey: string) => label?.(pubkey, fallbackLabel(pubkey)) ?? fallbackLabel(pubkey);
+  const peer = (pubkey: string, orderId?: string) =>
+    label?.(pubkey, fallbackLabel(pubkey), orderId) ?? fallbackLabel(pubkey);
   const open = disputes.filter((d) => d.status !== "resolved");
   const closed = disputes.filter((d) => d.status === "resolved");
 
@@ -52,11 +53,11 @@ export function SolverInbox({ disputes, onOpen, label }: Props) {
           </span>
         </div>
         <div className="op-meta">
-          abierta por {peer(item.initiator)} · orden {item.orderId.slice(0, 8)}…
+          abierta por {peer(item.initiator, item.orderId)} · orden {item.orderId.slice(0, 8)}…
         </div>
         <p className="op-reason">{item.reason || "Sin motivo especificado."}</p>
         {item.status === "taken" && item.winner && (
-          <div className="op-meta">la tomó {peer(item.winner)}</div>
+          <div className="op-meta">la tomó {peer(item.winner, item.orderId)}</div>
         )}
         {item.status === "resolved" && item.resolution && (
           <div className="op-meta">resolución: {resolutionLabel(item.resolution)}</div>

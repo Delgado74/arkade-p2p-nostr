@@ -2,10 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { hex } from "@scure/base";
 import type { VirtualCoin } from "@arkade-os/sdk";
-import type { ArkContext } from "../lib/arkade";
+import { chainTimeSeconds, type ArkContext } from "../lib/arkade";
 import { pubkeyFromInput, type Identity } from "../lib/identity";
 import { arbiterPubKey, coordinatorPubKey } from "../lib/config";
 import type { NostrClient } from "../lib/nostr";
+import type { OperationRecord } from "../lib/operations";
 import type { PeerLabel } from "../lib/useNyms";
 import {
   assertFunded,
@@ -25,6 +26,8 @@ import {
   type Escrow,
   type EscrowVtxoState,
 } from "../lib/escrow";
+import { derivePersonalArkAddress } from "../lib/escrowWallet";
+import { recoverEscrowVtxos } from "../lib/recovery";
 import {
   encodeTradeMessage,
   TRADE_APP,
@@ -36,6 +39,7 @@ import {
   type TradePayloads,
   type TradeRole,
 } from "../lib/trade";
+import { computeWindowState } from "../lib/windows";
 import { sendDm } from "../lib/dm";
 import { summarize } from "../lib/summary";
 import {
@@ -57,10 +61,21 @@ export interface TradeRequest {
   fiatAmount?: number;
   tradeSats?: number;
   paymentMethods?: string[];
-  /** Buyer's receive address (set when a buyer takes a sell order). */
+  /**
+   * Ark address published by the maker when it created the order: its payout
+   * address when it is the buyer, its refund address when it is the seller.
+   */
+  arkAddress?: string;
+  /** Ark address the taker stated when it took the order. */
+  takerArkAddress?: string;
+  /** Buyer's payout address, whoever stated it. */
   buyerArkAddress?: string;
-  /** Seller's refund address, taken from the maker's order (sell orders). */
+  /** Seller's refund address, whoever stated it. */
   refundAddress?: string;
+  /** True when the local identity published the order (maker), not took it. */
+  maker?: boolean;
+  /** The order's advertised side (`sell` offers BTC, `buy` wants BTC). */
+  orderType?: "buy" | "sell";
   /** Opened from the solver inbox: no counterparty filter, resolution UI only. */
   solver?: boolean;
 }
@@ -77,12 +92,22 @@ interface Props {
   disputeTakes?: DisputeTake[];
   /** Local pseudonym reader for pubkeys shown in the panel. */
   label?: PeerLabel;
+  /**
+   * Persist a patch on the operation record (e.g. the Ark address the user
+   * just typed). Addresses are asked for when the operation is opened, and
+   * must survive a reload so the user is never asked twice.
+   */
+  onRecord?: (patch: Partial<OperationRecord>) => void;
+  /** Opens the private chat with the counterparty of this operation. */
+  onOpenChat?: (orderId: string) => void;
 }
 
 /**
  * Newest incoming `take` (a buyer took one of our sell orders). A take is only
  * ever sent to the maker, so as the seller it targets our order and lets us
- * prefill the order id and counterparty automatically.
+ * prefill the order id and counterparty automatically. The taker's Ark address
+ * arrives in a separate `taker_address` DM; we prefer it, but a legacy take may
+ * still inline its address.
  */
 function findActiveTake(
   feed: TradeDm[],
@@ -90,11 +115,24 @@ function findActiveTake(
   for (let i = feed.length - 1; i >= 0; i--) {
     const entry = feed[i];
     if (entry.msg && entry.msg.type === "take" && !entry.dm.outgoing) {
-      return {
-        orderId: entry.msg.orderId,
-        from: entry.dm.sender,
-        buyerArkAddress: entry.msg.payload.buyerArkAddress,
-      };
+      const orderId = entry.msg.orderId;
+      const from = entry.dm.sender;
+      // Prefer the authenticated `taker_address` over the (legacy) inline one.
+      let address = entry.msg.payload.buyerArkAddress ?? "";
+      for (let j = feed.length - 1; j >= 0; j--) {
+        const c = feed[j].msg;
+        if (
+          c &&
+          c.type === "taker_address" &&
+          c.orderId === orderId &&
+          !feed[j].dm.outgoing &&
+          feed[j].dm.sender === from
+        ) {
+          address = c.payload.arkAddress.trim();
+          break;
+        }
+      }
+      return { orderId, from, buyerArkAddress: address };
     }
   }
   return null;
@@ -104,12 +142,15 @@ function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-/**
- * Window (seconds) a taken order has to produce the buyer's Ark address and get
- * the escrow funded. Past it, the maker may cancel and republish (no funds have
- * moved: the escrow VTXO does not exist yet).
- */
-const TAKE_TIMEOUT_SECONDS = 15 * 60;
+/** Compact countdown label, e.g. "23h 59m" or "4m 12s". */
+function formatCountdown(seconds: number): string {
+  if (seconds <= 0) return "0m";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  const s = Math.floor(seconds % 60);
+  return `${m}m ${s}s`;
+}
 
 /** Newest incoming `dispute`: only solvers in the set receive these. */
 function findActiveDispute(feed: TradeDm[]): TradeMessageOf<"dispute"> | null {
@@ -131,13 +172,18 @@ export function TradePanel({
   disputeAnnounces = [],
   disputeTakes = [],
   label,
+  onRecord,
+  onOpenChat,
 }: Props) {
   const [role, setRole] = useState<TradeRole>(request?.role ?? "seller");
   const [orderId, setOrderId] = useState(request?.orderId ?? "");
   const [counterparty, setCounterparty] = useState(request?.counterparty ?? "");
 
-  const peer = (key: string) =>
-    label?.(key, key ? `${key.slice(0, 12)}…` : "—") ?? (key ? `${key.slice(0, 12)}…` : "—");
+  // The alias is scoped to this operation, so the counterparty reads the same
+  // everywhere inside it and differently in any other one.
+  const peer = (key: string, scopeOrderId?: string) =>
+    label?.(key, key ? `${key.slice(0, 12)}…` : "—", scopeOrderId ?? orderId) ??
+    (key ? `${key.slice(0, 12)}…` : "—");
 
   const [tradeSats, setTradeSats] = useState(
     request?.tradeSats !== undefined ? String(request.tradeSats) : "",
@@ -146,14 +192,16 @@ export function TradePanel({
     request?.fiatAmount !== undefined ? String(request.fiatAmount) : "",
   );
   const [fiat, setFiat] = useState(request?.fiat ?? "USD");
+  // Payment methods are part of the offer's public advertisement (NIP-69 `pm`
+  // tags). The concrete payment data (account, phone, e-mail) never enters
+  // the app: the parties coordinate it in their private chat.
+  const payMethods = (request?.paymentMethods ?? []).join(", ");
 
   const [myArk, setMyArk] = useState(
     request?.role === "seller"
       ? (request?.refundAddress ?? "")
       : (request?.buyerArkAddress ?? ""),
   );
-  const [payMethods, setPayMethods] = useState((request?.paymentMethods ?? []).join(", "));
-  const [payDetails, setPayDetails] = useState("");
   const [disputeReason, setDisputeReason] = useState("");
 
   const [localVtxo, setLocalVtxo] = useState<VirtualCoin | null>(null);
@@ -163,13 +211,18 @@ export function TradePanel({
   const [localEscrowState, setLocalEscrowState] = useState<EscrowVtxoState | null>(null);
   // Coarse clock so timelock deadlines re-render without a per-second timer.
   const [nowSec, setNowSec] = useState(() => nowSeconds());
+  // Chain median-time-past, seeded from the wall clock until the first fetch lands.
+  const [chainSec, setChainSec] = useState(() => nowSeconds());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
   // Guards the one-shot automatic "funded" notice the seller sends.
   const announcedRef = useRef(false);
-  // Guards the one-shot "ark_address" claim each party sends to the solvers.
-  const claimedRef = useRef(false);
+  // Guards the one-shot `taker_address` DM the taker sends to the maker.
+  const takerAddrSentRef = useRef(false);
+  // Address requests already answered (keyed by the request DM id), so a solver
+  // asking once is never answered twice.
+  const addrRepliedRef = useRef<Set<string>>(new Set());
   // Optimistic: the take this solver published locally before the event
   // round-trips back from the relay. Kept with its orderId and solver key so it
   // never leaks into another dispute or another identity.
@@ -186,6 +239,10 @@ export function TradePanel({
   }, []);
 
   const solverView = Boolean(request?.solver);
+  // Whether the local identity published the order (maker) or took it (taker).
+  // Undefined on legacy records: treat as non-maker (conservative).
+  const isMaker = request?.maker === true;
+  const isTakerRole = request?.maker === false;
   const activeTake = !solverView && role === "seller" ? findActiveTake(feed) : null;
   // Only solvers receive dispute DMs, so an incoming one means we are a solver.
   const activeDispute = solverView ? null : findActiveDispute(feed);
@@ -249,11 +306,6 @@ export function TradePanel({
     return null;
   }
 
-  const takeMsg = lastOf("take");
-  // A take is already on the wire if we (as buyer) already had an address when
-  // the panel opened (book-initiated) or it appears in the feed. Prevents the
-  // double-take where both the order book and this button publish one.
-  const takeSent = !!takeMsg || !!request?.buyerArkAddress;
   const escrowMsg = lastOf("escrow");
   const disputeMsg = lastOf("dispute");
   // The agreement normally comes from our counterparty's `escrow` DM; a solver
@@ -262,7 +314,6 @@ export function TradePanel({
   const agreedAddress = escrowMsg?.payload.address ?? "";
   const agreedRefundAddress = escrowMsg?.payload.refundAddress ?? "";
   const pendingRelease = lastOf("release_request");
-  const paymentDetails = lastOf("payment_details");
   const fundedMsg = lastOf("funded");
   const arbiterDecision = lastOf("arbiter_decision");
   const disputeTakenMsg = lastOf("dispute_taken");
@@ -273,34 +324,47 @@ export function TradePanel({
   // asks the user to type again an address they already provided when creating
   // or taking the order. Priority: explicit `escrow`/`take` payloads, then the
   // authenticated `ark_address` claims, then the dispute hints.
-  const claimedAddressOf = (pub: string): string => {
+  const claimedAddressOf = (pub: string, partyRole?: TradeRole): string => {
     const target = pub.toLowerCase();
     for (let i = orderFeed.length - 1; i >= 0; i--) {
       const msg = orderFeed[i].msg;
-      if (msg?.type === "ark_address" && msg.from.toLowerCase() === target) {
-        return msg.payload.arkAddress.trim();
-      }
+      if (msg?.type !== "ark_address" || msg.from.toLowerCase() !== target) continue;
+      if (partyRole && msg.role !== partyRole) continue;
+      return msg.payload.arkAddress.trim();
     }
     return "";
   };
-  const escrowBuyerArk = lastOf("take")?.payload.buyerArkAddress ?? "";
+  // Both sides state an address: the maker published one with the order, the
+  // taker stated one when taking it (legacy `take` inline, or the dedicated,
+  // authenticated `taker_address` DM). The role carried by the message says
+  // which one is which.
+  const takeArk = lastOf("take")?.payload.buyerArkAddress ?? "";
+  const takerAddressMsg = lastOf("taker_address")?.payload.arkAddress?.trim() ?? "";
+  const takerDeliveredArk = takerAddressMsg || takeArk;
+  const takerRole = lastOf("take")?.role;
+  const makerArk = request?.arkAddress?.trim() ?? "";
+  const buyerArkFromMessages =
+    takerRole === "buyer" ? takerDeliveredArk : takerRole === "seller" ? makerArk : "";
+  const sellerArkFromMessages =
+    takerRole === "seller" ? takerDeliveredArk : takerRole === "buyer" ? makerArk : "";
   const disputeBuyerArk = disputeMsg?.payload.buyerArkAddress ?? "";
   const disputeSellerArk = disputeMsg?.payload.sellerArkAddress ?? "";
   const recoveredBuyerArk = (
-    escrowBuyerArk ||
-    (agreement ? claimedAddressOf(agreement.buyerPubKey) : "") ||
+    buyerArkFromMessages ||
+    (cpPub ? claimedAddressOf(cpPub, "buyer") : "") ||
     disputeBuyerArk
   ).trim();
   const recoveredSellerArk = (
     agreedRefundAddress ||
-    (agreement ? claimedAddressOf(agreement.sellerPubKey) : "") ||
+    sellerArkFromMessages ||
+    (cpPub ? claimedAddressOf(cpPub, "seller") : "") ||
+    (identity ? claimedAddressOf(identity.pubkeyHex, "seller") : "") ||
     disputeSellerArk
   ).trim();
   // Our own already-known Ark address, whichever side we play.
   const ownRecoveredArk = (role === "seller" ? recoveredSellerArk : recoveredBuyerArk).trim();
   // The buyer's payout address, from the `take` or any of the recovered sources.
-  const buyerArk =
-    lastOf("take")?.payload.buyerArkAddress ?? request?.buyerArkAddress ?? recoveredBuyerArk;
+  const buyerArk = buyerArkFromMessages || request?.buyerArkAddress || recoveredBuyerArk;
   // The value in effect: whatever the user typed, else the address carried on
   // the request (order creation/take), else the one recovered from the feed.
   // Reading it on render (no effect) means reopening an operation never asks
@@ -415,28 +479,41 @@ export function TradePanel({
     agreement && ctx ? escrowFromAgreement(agreement, ctx.network) : null;
 
   // Re-render roughly once a minute so the timelock state stays current.
+  // `chainSec` tracks the chain's median-time-past (what the CLTV is actually
+  // judged against) and falls back to the wall clock when Esplora is unreachable.
   useEffect(() => {
-    const timer = setInterval(() => setNowSec(nowSeconds()), 60000);
+    const tick = () => {
+      setNowSec(nowSeconds());
+      if (ctx) chainTimeSeconds(ctx).then(setChainSec).catch(() => undefined);
+    };
+    const timer = setInterval(tick, 60000);
+    tick();
     return () => clearInterval(timer);
-  }, []);
+  }, [ctx]);
 
   // The seller's timelocked refund opens once chain time reaches `refundLocktime`.
-  // We approximate chain time with wall clock (it tracks median-time-past).
-  const refundMature = Boolean(escrow && nowSec >= Number(escrow.refundLocktime));
+  const refundMature = Boolean(escrow && chainSec >= Number(escrow.refundLocktime));
 
-  // A taken order that produced neither the buyer's Ark address nor funding is
-  // stalled. The maker may cancel and republish once the window elapses; no
-  // funds have moved (the escrow VTXO does not exist yet), so this is safe and
-  // needs no counterparty agreement. The take's DM `createdAt` is relay-set, so
-  // it does not trust the sender's own clock.
-  const takeCreatedAt =
-    orderFeed.find((e) => e.msg?.type === "take" && !e.dm.outgoing)?.dm.createdAt ?? null;
-  const takeStalled = Boolean(
-    role === "seller" &&
-      takeCreatedAt !== null &&
-      !fundingKnown &&
-      nowSec - takeCreatedAt >= TAKE_TIMEOUT_SECONDS,
-  );
+  // --- Chained 15-minute windows -------------------------------------------------
+  //
+  // Every step of a trade has an owner who must act within the window, measured
+  // from the *previous* step's relay-set timestamp (never a sender's own clock):
+  // see `computeWindowState` for the full model. The party that blows its window
+  // is the *culprit*; a maker at fault republishes manually, a taker at fault
+  // lets the maker's order be republished automatically.
+  const windowState = computeWindowState({
+    feed: orderFeed,
+    orderId: effectiveOrderId,
+    role,
+    isMaker,
+    funded: fundingKnown,
+    now: nowSec,
+  });
+  const anyWindowExpired = windowState.anyExpired;
+  const windowCulprit = windowState.culprit;
+  // Only the maker can cancel/republish; a taker at fault just waits while the
+  // maker republishes. The maker at fault must do it manually.
+  const canCancelAndRepublishByWindow = isMaker && anyWindowExpired;
 
   // Auto-check funding: poll the indexer for the escrow VTXO so neither side
   // has to press "Comprobar fondeo". The query is public (no keys involved).
@@ -489,19 +566,46 @@ export function TradePanel({
       });
   }, [role, localVtxo, identity, cpPub, effectiveOrderId, client]);
 
-  // Advertise our own Ark payout address to every solver in the escrow's
-  // solver set (once), so arbitration never depends on the addresses embedded
-  // in a dispute payload. Each solver authenticates the claim by the sender key.
+  // Deliver the taker's Ark address to the maker (once) via the authenticated
+  // `taker_address` DM. This starts the taker's window: the maker can only
+  // build the escrow once it knows where the taker receives/refunds. We send
+  // only our own address, never the counterparty's.
   useEffect(() => {
-    if (claimedRef.current || !escrowMsg || !identity || !effectiveOrderId) return;
+    if (takerAddrSentRef.current) return;
+    if (!isTakerRole || !identity || !effectiveOrderId || !cpPub) return;
     const addr = effectiveMyArk;
     if (!addr) return;
-    const agr = escrowMsg.payload.agreement;
-    const recipients = new Set(agr.arbiterPubKeys.map((p) => p.toLowerCase()));
-    if (arbiter) recipients.add(arbiter.toLowerCase());
-    recipients.delete(identity.pubkeyHex.toLowerCase());
-    if (recipients.size === 0) return;
-    claimedRef.current = true;
+    takerAddrSentRef.current = true;
+    const msg: TradeMessageOf<"taker_address"> = {
+      app: TRADE_APP,
+      v: TRADE_VERSION,
+      type: "taker_address",
+      orderId: effectiveOrderId,
+      role,
+      from: identity.pubkeyHex,
+      ts: nowSeconds(),
+      payload: { arkAddress: addr },
+    };
+    sendDm(client.pool, client.relays, identity, cpPub, encodeTradeMessage(msg)).catch(() => {
+      takerAddrSentRef.current = false;
+    });
+  }, [isTakerRole, identity, effectiveOrderId, cpPub, effectiveMyArk, role, client]);
+
+  // Answer a solver's address request with our own, authenticated `ark_address`.
+  // Solvers never learn the parties' addresses before a dispute: they request
+  // them here and each party states its own (the DM sender key authenticates
+  // it), so a solver never pays an address a disputant typed on the other's
+  // behalf.
+  useEffect(() => {
+    if (!identity || !effectiveOrderId || !effectiveMyArk) return;
+    const request = relevant.find(
+      (e) => e.msg?.type === "ark_address_request" && !e.dm.outgoing,
+    );
+    if (!request) return;
+    const key = `${request.dm.id}`;
+    if (addrRepliedRef.current.has(key)) return;
+    addrRepliedRef.current.add(key);
+    const agr = escrowMsg?.payload.agreement;
     const msg: TradeMessageOf<"ark_address"> = {
       app: TRADE_APP,
       v: TRADE_VERSION,
@@ -510,15 +614,14 @@ export function TradePanel({
       role,
       from: identity.pubkeyHex,
       ts: nowSeconds(),
-      payload: { agreement: agr, arkAddress: addr },
+      payload: { ...(agr ? { agreement: agr } : {}), arkAddress: effectiveMyArk },
     };
-    const encoded = encodeTradeMessage(msg);
-    Promise.all(
-      [...recipients].map((r) => sendDm(client.pool, client.relays, identity, r, encoded)),
-    ).catch(() => {
-      claimedRef.current = false;
-    });
-  }, [escrowMsg, arbiter, identity, effectiveOrderId, effectiveMyArk, role, client]);
+    sendDm(client.pool, client.relays, identity, request.dm.sender, encodeTradeMessage(msg)).catch(
+      () => {
+        addrRepliedRef.current.delete(key);
+      },
+    );
+  }, [relevant, identity, effectiveOrderId, effectiveMyArk, role, client, escrowMsg]);
 
   function run<T>(fn: () => Promise<T>) {
     setBusy(true);
@@ -553,24 +656,6 @@ export function TradePanel({
     await sendTo(cpPub, kind, payload);
   }
 
-  function handleSendTake() {
-    if (!effectiveMyArk) throw new Error("indica tu dirección Ark de cobro");
-    run(async () => {
-      await send("take", { buyerArkAddress: effectiveMyArk });
-      setStatus("Toma enviada al vendedor.");
-    });
-  }
-
-  function handleSendPaymentDetails() {
-    run(async () => {
-      await send("payment_details", {
-        methods: payMethods.split(",").map((m) => m.trim()).filter(Boolean),
-        details: payDetails.trim(),
-      });
-      setStatus("Datos de pago enviados al comprador.");
-    });
-  }
-
   function handleFiatSent() {
     run(async () => {
       await send("fiat_sent", {});
@@ -603,32 +688,33 @@ export function TradePanel({
   }
 
   /**
-   * Maker-only: cancel a stalled taken order and republish a fresh, equivalent
-   * offer. Safe because nothing was funded (the escrow VTXO does not exist), so
-   * it needs no counterparty agreement.
+   * Maker-only: cancel an order whose chained window expired and republish a
+   * fresh, equivalent offer. Safe because nothing was funded (the escrow VTXO
+   * does not exist), so it needs no counterparty agreement. The republished
+   * listing preserves the original side (`sell`/`buy`) and payment methods.
    */
   function handleCancelAndRepublish() {
     if (!identity) throw new Error("sin identidad");
-    if (role !== "seller") throw new Error("solo el creador de la orden puede republicar");
-    if (!takeStalled) throw new Error("la operación aún está dentro del plazo");
+    if (!isMaker) throw new Error("solo el creador de la orden puede republicar");
+    if (!canCancelAndRepublishByWindow) throw new Error("la operación aún está dentro del plazo");
     const fiat = agreement?.fiat ?? (request?.fiat ?? "USD");
     const fiatAmount = agreement?.fiatAmount ?? request?.fiatAmount;
     const tradeSats = agreement?.tradeSats ?? request?.tradeSats;
     if (fiatAmount === undefined || tradeSats === undefined) {
       throw new Error("faltan datos de la orden para republicar");
     }
-    const methods =
-      request?.paymentMethods ??
-      payMethods
-        .split(",")
-        .map((m) => m.trim())
-        .filter(Boolean);
+    const methods = request?.paymentMethods ?? [];
+    // The republished order keeps the maker's Ark address, which is mandatory
+    // for every offer, and the original side it advertised.
+    const arkAddress = effectiveMyArk;
+    if (!arkAddress) throw new Error("indica tu dirección Ark para republicar la orden");
+    const orderType = request?.orderType ?? "sell";
     run(async () => {
       // Best effort: retire the stalled listing. A new `d` is published below,
       // so relays without NIP-09 support still only surface the fresh order.
       await client.setOrderStatus(identity, effectiveOrderId, "canceled").catch(() => undefined);
       const template = buildOrderTemplate({
-        type: "sell",
+        type: orderType,
         fiat,
         fiatAmount,
         amountSats: tradeSats,
@@ -636,7 +722,7 @@ export function TradePanel({
         paymentMethods: methods,
         expiresAt: nowSeconds() + 24 * 3600,
         name: identity.npub,
-        arkRefundAddress: effectiveMyArk || recoveredSellerArk || undefined,
+        arkAddress,
       });
       const event = await client.publish(template, identity);
       const id = event.tags.find((t) => t[0] === "d")?.[1] ?? event.id;
@@ -665,6 +751,11 @@ export function TradePanel({
       if (solverSet.length === 0) {
         throw new Error("no hay solvers: revisa el registro del coordinador o VITE_ARBITER");
       }
+      // Anchor the refund timelock to *chain* time (median-time-past), not the
+      // local clock: BIP-113 evaluates the escrow's seconds-typed CLTV against
+      // MTP, and a skewed local clock would put the two peers' derived scripts
+      // and the maturity check out of step with the network.
+      const chainNow = await chainTimeSeconds(ctx);
       const agr: EscrowAgreement = {
         orderId: effectiveOrderId,
         fiat: fiat.trim().toUpperCase(),
@@ -674,7 +765,7 @@ export function TradePanel({
         sellerPubKey: identity.pubkeyHex,
         arbiterPubKeys: solverSet,
         serverPubKey: hex.encode(ctx.serverPubKey),
-        refundLocktime: refundLocktimeFrom(Date.now() / 1000).toString(),
+        refundLocktime: refundLocktimeFrom(chainNow).toString(),
       };
       const built = escrowFromAgreement(agr, ctx.network);
       await send("escrow", {
@@ -682,12 +773,11 @@ export function TradePanel({
         address: built.address,
         refundAddress: effectiveMyArk,
       });
-      // Advertise our payout address to every solver so disputes never rely on
-      // the addresses a disputant claims on the counterparty's behalf.
-      claimedRef.current = true;
-      void Promise.allSettled(
-        solverSet.map((solver) => sendTo(solver, "ark_address", { agreement: agr, arkAddress: effectiveMyArk })),
-      ).catch(() => undefined);
+      onRecord?.({ refundAddress: effectiveMyArk });
+      // Solvers are *not* told our address here: they only learn a party's
+      // payout address once a dispute is open, by requesting it (the party then
+      // answers with an authenticated `ark_address`). This keeps the addresses
+      // of undisputed trades private.
       setStatus(`Escrow acordado con ${solverSet.length} solver(s). Dirección a fondear: ${built.address}`);
     });
   }
@@ -813,6 +903,30 @@ export function TradePanel({
     });
   }
 
+  /**
+   * Seller-only: recover a swept escrow VTXO.
+   *
+   * A swept VTXO cannot be spent through its leaf (`SubmitOffchainTx` rejects
+   * it); the only off-chain way back is a settlement, which the SDK's
+   * `VtxoManager.recoverVtxos()` drives using the escrow's `refund` leaf as the
+   * forfeit closure. That leaf is CLTV-gated on `refundLocktime`, so recovery
+   * only succeeds once the timelock has matured.
+   */
+  function handleRecover() {
+    if (!identity || !ctx) throw new Error("falta identidad o ASP");
+    if (!escrow) throw new Error("falta el acuerdo de escrow");
+    if (role !== "seller") throw new Error("solo el vendedor (quien fondea el escrow) puede recuperarlo");
+    if (!refundMature)
+      throw new Error("la recuperación aún no está disponible (plazo de reembolso sin vencer)");
+    run(async () => {
+      const dest = derivePersonalArkAddress(identity, ctx);
+      const arkTxid = await recoverEscrowVtxos(ctx, identity, escrow, (event) => {
+        setStatus(`Recuperando escrow: ${event.type}…`);
+      });
+      setStatus(`Escrow recuperado y asentado en ${dest} (tx ${arkTxid}).`);
+    });
+  }
+
   /** Buyer or seller escalates to every solver in the escrow's solver set. */
   function handleOpenDispute() {
     if (!identity) throw new Error("sin identidad");
@@ -838,6 +952,17 @@ export function TradePanel({
       await Promise.all(
         recipients.map((solver) => sendTo(solver, "dispute", payload)),
       );
+      // 3. State *our own* payout address to the solver, signed by our key.
+      //    Solvers never learn addresses before a dispute; the initiator gives
+      //    its own up front, and the other party answers the solver's request.
+      const mine = effectiveMyArk;
+      if (mine) {
+        await Promise.allSettled(
+          recipients.map((solver) =>
+            sendTo(solver, "ark_address", { agreement, arkAddress: mine }),
+          ),
+        );
+      }
       setStatus(`Disputa publicada y enviada a ${recipients.length} solver(s).`);
     });
   }
@@ -872,6 +997,28 @@ export function TradePanel({
   }
 
   /**
+   * Solver-only: ask both parties for their authenticated Ark payout addresses.
+   * Solvers learn no addresses before a dispute, so they must request them once
+   * they own the dispute; each party answers with a signed `ark_address`.
+   */
+  function handleRequestAddresses() {
+    if (!identity) throw new Error("sin identidad");
+    if (!agreement) throw new Error("aún no hay acuerdo de escrow");
+    if (!holdsTake) throw new Error("toma la disputa antes de pedir las direcciones");
+    run(async () => {
+      const parties = [...new Set([agreement.buyerPubKey, agreement.sellerPubKey])].filter(
+        (p) => p.toLowerCase() !== identity.pubkeyHex.toLowerCase(),
+      );
+      await Promise.all(
+        parties.map((party) =>
+          sendTo(party, "ark_address_request", { reason: "disputa en curso" }),
+        ),
+      );
+      setStatus(`Pedidas las direcciones Ark a ${parties.length} parte(s).`);
+    });
+  }
+
+  /**
    * The Ark payout address a party confirmed to the arbiter via an
    * authenticated `ark_address` DM. Returns null when no matching claim has
    * arrived, in which case the arbiter must not pay that party.
@@ -887,12 +1034,39 @@ export function TradePanel({
         e.msg.from.toLowerCase() === pub,
     );
     if (!claim || !claim.msg || claim.msg.type !== "ark_address") return null;
+    // A claim may arrive without an agreement (the buyer states its address
+    // to the seller before the escrow exists). The DM author is what
+    // authenticates it, so the agreement is only checked when it is there.
     const a = claim.msg.payload.agreement;
-    if (a.buyerPubKey !== agr.buyerPubKey || a.sellerPubKey !== agr.sellerPubKey) return null;
+    if (a && (a.buyerPubKey !== agr.buyerPubKey || a.sellerPubKey !== agr.sellerPubKey)) {
+      return null;
+    }
     return claim.msg.payload.arkAddress.trim() || null;
   }
 
-  /** A solver resolves the dispute by spending the escrow via their leaf. */
+  /**
+   * A solver resolves the dispute by spending the escrow via their own
+   * `arbiter` leaf (solver + server).
+   *
+   * Process (deliberately not "wait for the seller"):
+   *
+   *  1. A dispute is almost always opened by the **buyer**: it paid fiat and the
+   *     seller is refusing (or unable) to co-sign the release. The seller has
+   *     little incentive to dispute because the escrow's `refund` leaf already
+   *     lets it reclaim the sats once the locktime matures.
+   *  2. The escrow's `arbiter` leaf has **no CLTV**, so the solver can pay the
+   *     authenticated buyer *at any time*, without waiting for the locktime.
+   *  3. The solver must therefore act on the *evidence*, not on the seller's
+   *     silence: if the buyer proves it paid, the solver releases to the buyer
+   *     before the seller can execute `refund` at the locktime. Waiting for an
+   *     unresponsive seller would hand the escrow back to the seller and rob a
+   *     paying buyer.
+   *  4. Conversely, absent buyer evidence, the solver must **not** release; the
+   *     seller recovers via the timelocked refund and the buyer keeps nothing.
+   *
+   * The destination is the winner's *authenticated* `ark_address` (signed by
+   * the party itself), never an address a disputant typed on the other's behalf.
+   */
   function handleArbiterDecide(outcome: "release_to_buyer" | "refund_to_seller") {
     if (!identity || !ctx) throw new Error("falta identidad o ASP");
     if (!isSolver) throw new Error("no eres solver de esta disputa");
@@ -904,7 +1078,7 @@ export function TradePanel({
     const sats = p.agreement.tradeSats;
     if (!destination) {
       throw new Error(
-        `no tengo la dirección Ark autenticada del ${winner === "buyer" ? "comprador" : "vendedor"}; debe enviarla al solver (se envía sola al acordar el escrow)`,
+        `no tengo la dirección Ark autenticada del ${winner === "buyer" ? "comprador" : "vendedor"}; pídesela con "Pedir direcciones Ark a las partes"`,
       );
     }
     run(async () => {
@@ -947,6 +1121,18 @@ export function TradePanel({
   const authBuyerAddr = isSolver && disputeMsg ? authenticatedAddress("buyer") : null;
   const authSellerAddr = isSolver && disputeMsg ? authenticatedAddress("seller") : null;
 
+  // The race the solver is running against: once chain time reaches the escrow's
+  // `refundLocktime`, the seller can reclaim the escrow through the `refund`
+  // leaf (seller + server), even without the solver. Before that, the solver's
+  // `arbiter` leaf can pay the authenticated buyer at any time. So the solver
+  // must act *before* this deadline when the evidence favours the buyer — it
+  // must not wait for the seller to answer.
+  const solverDeadline =
+    disputeMsg !== null ? Number(disputeMsg.payload.agreement.refundLocktime ?? 0) : 0;
+  const solverSecondsLeft = solverDeadline > 0 ? solverDeadline - chainSec : 0;
+  // Window within which the deadline is close enough to escalate the warning.
+  const deadlineNear = solverDeadline > 0 && solverSecondsLeft <= 6 * 3600;
+
   return (
     <section className="panel">
       <h2>Detalle de la operación</h2>
@@ -962,7 +1148,9 @@ export function TradePanel({
       {solverView && (
         <p style={{ color: "#2563eb", fontSize: "0.9em" }}>
           Modo solver: ves los mensajes de ambas partes. Toma la disputa y resuélvela en la
-          sección de abajo.
+          sección de abajo. Si el comprador prueba que pagó, paga al comprador por tu hoja de
+          árbitro <strong>antes</strong> del locktime del escrow: no esperes al vendedor, porque
+          al vencer el plazo el vendedor puede recuperar los sats.
         </p>
       )}
 
@@ -1012,20 +1200,46 @@ export function TradePanel({
         </p>
       )}
 
-      {takeStalled && (
+      {anyWindowExpired && (
         <div style={{ padding: 8, border: "1px solid #f59e0b55", borderRadius: 8, marginTop: 8 }}>
           <p style={{ fontSize: "0.9em", color: "#b45309", margin: 0 }}>
-            La orden fue tomada hace más de 15 minutos sin recibir la dirección Ark del comprador ni
-            el fondeo del escrow. Puedes cancelarla y publicar una nueva (no se movió ningún fondo).
+            {windowCulprit === "taker" && isMaker && (
+              <>
+                El taker no completó su paso dentro de los 15 minutos (no entregó su dirección Ark
+                o no fondeó el escrow siendo el vendedor). No se movió ningún fondo. Puedes
+                republicar tu oferta; se hará automáticamente y también puedes hacerlo ahora.
+              </>
+            )}
+            {windowCulprit === "maker" && isMaker && (
+              <>
+                No completaste tu paso dentro de los 15 minutos (construir el escrow o fondeado).
+                No se movió ningún fondo. Cancela y republica tu oferta manualmente para
+                responsabilizarte con la operación.
+              </>
+            )}
+            {windowCulprit === "maker" && !isMaker && (
+              <>
+                La contraparte (maker) no completó su paso dentro de los 15 minutos. Puedes esperar
+                a que republique su oferta; no se movió ningún fondo.
+              </>
+            )}
+            {windowCulprit === "taker" && !isMaker && (
+              <>
+                No completaste tu paso dentro de los 15 minutos (entregar tu dirección Ark o
+                fondear el escrow). La oferta del maker se republicará; no se movió ningún fondo.
+              </>
+            )}
           </p>
-          <button
-            type="button"
-            style={{ marginTop: 8 }}
-            disabled={busy || !identity}
-            onClick={handleCancelAndRepublish}
-          >
-            Cancelar y republicar orden
-          </button>
+          {isMaker && (
+            <button
+              type="button"
+              style={{ marginTop: 8 }}
+              disabled={busy || !identity}
+              onClick={handleCancelAndRepublish}
+            >
+              Cancelar y republicar orden
+            </button>
+          )}
         </div>
       )}
 
@@ -1044,12 +1258,20 @@ export function TradePanel({
               onChange={(e) => setFiatAmount(e.target.value)}
             />
             <input placeholder="fiat (USD, CUP…)" value={fiat} onChange={(e) => setFiat(e.target.value)} />
+          </div>
+          <p className="panel-note" style={{ fontSize: "0.85em" }}>
+            Ya tienes todos los datos: el comprador recibe en{" "}
+            <code>{buyerArk || "—"}</code> y tú reembolses en{" "}
+            <code>{effectiveMyArk || "—"}</code>. Crea el escrow y fóndalo; los detalles del método
+            de pago los coordináis por DM.
+          </p>
+          {!effectiveMyArk && (
             <input
               placeholder="mi dirección Ark (reembolsos)"
-              value={myArk || ownRecoveredArk}
+              value={myArk}
               onChange={(e) => setMyArk(e.target.value)}
             />
-          </div>
+          )}
           <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button
               type="button"
@@ -1092,10 +1314,34 @@ export function TradePanel({
             </p>
           )}
           {vtxo && escrowRecoverable && (
-            <p className="panel-note" style={{ fontSize: "0.85em", opacity: 0.9 }}>
-              El escrow quedó <strong>barrido (swept)</strong>: sus fondos deben recuperarse antes de
-              poder liberarse, reembolsarse o disputarse.
-            </p>
+            <div className="panel-note" style={{ fontSize: "0.85em", opacity: 0.9 }}>
+              <p style={{ margin: 0 }}>
+                El escrow quedó <strong>barrido (swept)</strong>: sus fondos deben recuperarse antes de
+                poder liberarse, reembolsarse o disputarse.
+              </p>
+              {role === "seller" && escrow && (
+                <div style={{ marginTop: 6, display: "flex", gap: 8, alignItems: "center" }}>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={busy || !refundMature}
+                    title={
+                      refundMature
+                        ? undefined
+                        : `La recuperación se habilita el ${new Date(Number(escrow.refundLocktime) * 1000).toLocaleString()}`
+                    }
+                    onClick={handleRecover}
+                  >
+                    Recuperar escrow
+                  </button>
+                  {!refundMature && (
+                    <span style={{ opacity: 0.8 }}>
+                      Disponible el {new Date(Number(escrow.refundLocktime) * 1000).toLocaleString()}
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
           )}
           {vtxo && escrow && !refundMature && releaseDone === null && (
             <p className="panel-note" style={{ fontSize: "0.85em", opacity: 0.8 }}>
@@ -1103,49 +1349,65 @@ export function TradePanel({
               escrow el {new Date(Number(escrow.refundLocktime) * 1000).toLocaleString()}.
             </p>
           )}
-
-          <h3>Datos de pago (los recibe el comprador)</h3>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 520 }}>
-            <input
-              placeholder="métodos de pago (coma-separados)"
-              value={payMethods}
-              onChange={(e) => setPayMethods(e.target.value)}
-            />
-            <input
-              placeholder="datos concretos (teléfono, cuenta, titular…)"
-              value={payDetails}
-              onChange={(e) => setPayDetails(e.target.value)}
-            />
-          </div>
-          <button
-            type="button"
-            style={{ marginTop: 8 }}
-            disabled={busy || !canSend}
-            onClick={handleSendPaymentDetails}
-          >
-            Enviar datos de pago
-          </button>
         </>
       )}
 
       {!solverView && role === "buyer" && (
         <>
           <h3>Datos del comprador</h3>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, maxWidth: 520 }}>
+          <p className="panel-note" style={{ fontSize: "0.85em" }}>
+            Recibes en <code>{effectiveMyArk || "—"}</code>
+            {effectiveMyArk ? "" : " (indícala para poder liberar el escrow)"}
+          </p>
+          {!effectiveMyArk && (
             <input
               placeholder="mi dirección Ark de cobro"
-              value={myArk || ownRecoveredArk}
+              value={myArk}
               onChange={(e) => setMyArk(e.target.value)}
             />
-          </div>
-          <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button
-              type="button"
-              disabled={busy || !canSend || !effectiveMyArk || takeSent}
-              onClick={handleSendTake}
+          )}
+          {pendingRelease && (
+            <div
+              className="panel-note"
+              style={{
+                marginTop: 12,
+                padding: "10px 12px",
+                border: "1px solid rgba(245, 158, 11, 0.6)",
+                borderRadius: 8,
+                background: "rgba(245, 158, 11, 0.12)",
+              }}
             >
-              {takeSent ? "Toma enviada" : "Enviar toma (take)"}
-            </button>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>
+                Propuesta de liberación del vendedor
+              </div>
+              <div style={{ fontSize: "0.9em", display: "flex", flexDirection: "column", gap: 4 }}>
+                <div>
+                  <strong>Sats a recibir:</strong> {pendingRelease.payload.sats ?? agreement?.tradeSats ?? "—"} sats
+                </div>
+                <div>
+                  <strong>Destino propuesto:</strong>{" "}
+                  <code style={{ wordBreak: "break-all" }}>{pendingRelease.payload.to || "—"}</code>
+                </div>
+                <div>
+                  <strong>Tu dirección Ark:</strong>{" "}
+                  <code style={{ wordBreak: "break-all" }}>{effectiveMyArk || "—"}</code>
+                </div>
+                {pendingRelease.payload.to &&
+                  effectiveMyArk &&
+                  pendingRelease.payload.to.trim().toLowerCase() !== effectiveMyArk.trim().toLowerCase() && (
+                    <div style={{ color: "#f59e0b", fontWeight: 600 }}>
+                      ¡Atención! La dirección propuesta NO coincide con tu dirección Ark. Revisa antes de firmar.
+                    </div>
+                  )}
+                {pendingRelease.payload.to &&
+                  effectiveMyArk &&
+                  pendingRelease.payload.to.trim().toLowerCase() === effectiveMyArk.trim().toLowerCase() && (
+                    <div style={{ color: "#22c55e" }}>La dirección propuesta coincide con tu dirección Ark.</div>
+                  )}
+              </div>
+            </div>
+          )}
+          <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button type="button" disabled={busy || !canSend} onClick={handleFiatSent}>
               Avisar pago fiat
             </button>
@@ -1167,12 +1429,28 @@ export function TradePanel({
               Verificar, firmar y liberar
             </button>
           </div>
-          {paymentDetails && (
-            <div style={{ marginTop: 8, padding: 8, border: "1px solid #8884", borderRadius: 8 }}>
-              <strong>Datos de pago del vendedor</strong>
-              <div>{paymentDetails.payload.methods.join(", ")}</div>
-              <div style={{ whiteSpace: "pre-wrap" }}>{paymentDetails.payload.details}</div>
-            </div>
+        </>
+      )}
+
+      {!solverView && (
+        <>
+          <h3>Métodos de pago</h3>
+          <p className="panel-note" style={{ fontSize: "0.85em", opacity: 0.9 }}>
+            {payMethods
+              ? `Métodos anunciados en la oferta: ${payMethods}.`
+              : "La oferta no anuncia métodos de pago."}{" "}
+            Los datos concretos (cuenta, teléfono, correo) se coordinan en el{" "}
+            <strong>chat privado</strong> con la contraparte: la app no los maneja ni los guarda.
+          </p>
+          {onOpenChat && effectiveOrderId && (
+            <button
+              type="button"
+              style={{ marginTop: 8 }}
+              disabled={busy}
+              onClick={() => onOpenChat(effectiveOrderId)}
+            >
+              Abrir chat con la contraparte
+            </button>
           )}
         </>
       )}
@@ -1212,6 +1490,33 @@ export function TradePanel({
             {disputeMsg.payload.agreement.fiatAmount.toLocaleString()}{" "}
             {disputeMsg.payload.agreement.fiat} · orden {effectiveOrderId.slice(0, 8)}…
           </div>
+          {solverDeadline > 0 && (
+            <div
+              style={{
+                margin: "6px 0",
+                padding: "6px 8px",
+                borderRadius: 6,
+                fontSize: "0.9em",
+                background: deadlineNear ? "#fef3c7" : "#eff6ff",
+                color: deadlineNear ? "#92400e" : "#1e3a8a",
+              }}
+            >
+              {solverSecondsLeft <= 0 ? (
+                <>
+                  El plazo de reembolso del escrow <strong>ya maduró</strong>: el vendedor puede
+                  recuperar los sats por su hoja de refund. Si las pruebas favorecen al comprador,
+                  actúa ya o el comprador perderá sus fondos.
+                </>
+              ) : (
+                <>
+                  Tiempo antes de que el vendedor pueda recuperar el escrow por su locktime:{" "}
+                  <strong>{formatCountdown(solverSecondsLeft)}</strong>. Con pruebas suficientes de
+                  que el comprador pagó, <strong>no esperes</strong> al vendedor: paga al comprador
+                  por tu hoja de árbitro antes de que venza.
+                </>
+              )}
+            </div>
+          )}
           <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
             anuncio público:{" "}
             {announceForOrder ? (
@@ -1243,6 +1548,17 @@ export function TradePanel({
               Tomar disputa (publicar take)
             </button>
           )}
+          {holdsTake && !takenByOther && (!authBuyerAddr || !authSellerAddr) && (
+            <button
+              type="button"
+              disabled={busy || !identity || !agreement}
+              onClick={handleRequestAddresses}
+              style={{ marginBottom: 8, marginLeft: 8 }}
+              title="Pide a las partes su dirección Ark autenticada para poder pagarles"
+            >
+              Pedir direcciones Ark a las partes
+            </button>
+          )}
           <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
             comprador →{" "}
             {authBuyerAddr ? (
@@ -1271,6 +1587,12 @@ export function TradePanel({
             <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
               <button
                 type="button"
+                className={deadlineNear && authBuyerAddr ? "btn btn-primary" : undefined}
+                style={
+                  deadlineNear && authBuyerAddr
+                    ? { fontWeight: 700, outline: "2px solid #dc2626" }
+                    : undefined
+                }
                 disabled={busy || !ctx || !authBuyerAddr}
                 title={authBuyerAddr ? undefined : "Falta la dirección autenticada del comprador"}
                 onClick={() => handleArbiterDecide("release_to_buyer")}

@@ -31,6 +31,28 @@ export interface OperationRecord {
   refundAddress?: string;
   /** Buyer's Ark payout address, carried over from the order/take. */
   buyerArkAddress?: string;
+  /** Ark address published by the maker when it created the order. */
+  makerArkAddress?: string;
+  /**
+   * True when the local identity published the order (maker), false when it
+   * took it (taker). Undefined on records created before this field existed.
+   */
+  maker?: boolean;
+  /**
+   * The order's advertised side: `sell` (offers BTC) or `buy` (wants BTC).
+   * Kept so a republish reproduces the same listing.
+   */
+  orderType?: "buy" | "sell";
+  /**
+   * Stars (1-5) the local identity left for the counterparty, once the trade
+   * finished. Undefined means it has not rated yet; set it to stop prompting.
+   */
+  myRating?: number;
+  /**
+   * Event id of the public order (kind 38383). A rating points at it via its
+   * `e` tag, so viewers can verify the rated trade actually exists and ended.
+   */
+  orderEventId?: string;
 }
 
 /** True when the operation is no longer live (finished or aborted). */
@@ -117,6 +139,11 @@ export function recordOperation(
     updatedAt: now,
     refundAddress: patch.refundAddress ?? existing?.refundAddress,
     buyerArkAddress: patch.buyerArkAddress ?? existing?.buyerArkAddress,
+    makerArkAddress: patch.makerArkAddress ?? existing?.makerArkAddress,
+    maker: patch.maker ?? existing?.maker,
+    orderType: patch.orderType ?? existing?.orderType,
+    myRating: patch.myRating ?? existing?.myRating,
+    orderEventId: patch.orderEventId ?? existing?.orderEventId,
   };
   const next = [merged, ...list.filter((op) => op.orderId !== orderId)];
   persist(pubkey, next);

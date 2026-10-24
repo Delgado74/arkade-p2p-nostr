@@ -36,6 +36,16 @@ import type { Identity } from "./identity";
  *   that mirrors Mostro's VHTLC refund: the buyer must release or open a dispute
  *   before the timelock matures, otherwise the seller (with the server) can
  *   refund alone.
+ *
+ * Crucially, `refund` is also the leaf the SDK annotates as the *forfeit
+ * closure*. A VTXO swept out of its batch can only be recovered through a
+ * settlement, and arkd's `ForfeitTxReadyToBroadcast` demands a signature for
+ * every pubkey of the forfeit leaf. Had the forfeit leaf been the 3-of-3
+ * `release`, a swept escrow would be trapped unless the buyer co-signed.
+ * Stamping `refund` (seller + server, CLTV-gated) lets the seller — the party
+ * that funded the escrow — recover alone with the ASP, and only after
+ * `refundLocktime`, so the buyer's guarantee still holds.
+ *
  * - For each solver in the set, there is an `arbiter:<solver>` leaf:
  *   `solver + server` (2-of-2) — dispute resolution/refund through that solver.
  */
@@ -146,6 +156,12 @@ function toXOnlyArray(keys: Uint8Array[]): Uint8Array[] {
  * Leaf order: [release, refund, solver_0, solver_1, ...] where solvers are
  * sorted by their x-only hex pubkey to ensure determinism across all
  * participants.
+ *
+ * `release` stays first on purpose: it is the collaborative leaf, and
+ * `ForfeitClosures()[0]` (the SDK's default collaborative/forfeit leaf) must
+ * remain the release leaf so a cooperative spend keeps requiring the full
+ * 3-of-3. Recovery is driven separately by the handler's `deriveTapscripts`,
+ * which stamps the `refund` leaf.
  */
 export function buildEscrow(config: EscrowConfig, network: Network): Escrow {
   const buyer = toXOnly(config.buyerPubKey, "buyer");

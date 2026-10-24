@@ -14,14 +14,18 @@ import {
   DISPUTE_TAKE_KIND,
   DISPUTE_RESOLUTION_KIND,
   SOLVERS_KIND,
+  RATING_KIND,
   parseSolverRegistry,
   parseDisputeAnnounce,
   parseDisputeTake,
   parseDisputeResolution,
+  parseRating,
+  buildRatingTemplate,
   type SolverRegistry,
   type DisputeAnnounce,
   type DisputeTake,
   type DisputeResolution,
+  type Rating,
 } from "./protocol";
 import type { Identity } from "./identity";
 
@@ -352,6 +356,63 @@ export class NostrClient {
       oneose: handlers.onEose,
     });
     return { close: () => subscription.close() };
+  }
+
+  /** Publish a 1-5 star rating of a trade counterpart. */
+  async publishRating(
+    identity: Identity,
+    params: {
+      orderId: string;
+      orderEventId: string;
+      ratee: string;
+      value: number;
+      role: "buyer" | "seller";
+    },
+  ): Promise<Event> {
+    return this.publish(buildRatingTemplate(params), identity);
+  }
+
+  /**
+   * Fetch every rating ever *received* by `pubkey` (tag `#p`), newest first.
+   * Addressable `d` collapses to the latest per (rater, order) so a rater
+   * cannot inflate their own count by republishing.
+   */
+  async fetchRatingsReceived(pubkey: string, limit = 500): Promise<Rating[]> {
+    const events = await this.pool.querySync(this.relays, {
+      kinds: [RATING_KIND],
+      "#p": [pubkey.toLowerCase()],
+      limit,
+    });
+    return dedupeAddressable(events)
+      .map(parseRating)
+      .filter((r): r is Rating => r !== null)
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  /** Fetch ratings authored by a single rater (tag `authors`). */
+  async fetchRatingsBy(rater: string, limit = 500): Promise<Rating[]> {
+    const events = await this.pool.querySync(this.relays, {
+      kinds: [RATING_KIND],
+      authors: [rater.toLowerCase()],
+      limit,
+    });
+    return dedupeAddressable(events)
+      .map(parseRating)
+      .filter((r): r is Rating => r !== null)
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  /**
+   * Fetch the raw order event referenced by a rating, so a viewer can verify
+   * the rated trade actually exists and finished. Returns null when absent.
+   */
+  async fetchOrderEventById(eventId: string): Promise<Event | null> {
+    const events = await this.pool.querySync(this.relays, {
+      ids: [eventId],
+      kinds: [ORDER_KIND],
+      limit: 1,
+    });
+    return events[0] ?? null;
   }
 }
 

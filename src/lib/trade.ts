@@ -39,10 +39,19 @@ export interface EscrowAgreement {
 
 /** Payload variants keyed by message type. */
 export interface TradePayloads {
-  /** Buyer announces the Ark address that should receive the released funds. */
-  take: { buyerArkAddress: string };
-  /** Concrete (private) fiat payment instructions. */
-  payment_details: { methods: string[]; details: string };
+  /**
+   * A taker signals interest in the order. The role it will play is in the
+   * message's `role`; the message carries no address — the taker delivers its
+   * Ark payout/refund address separately via `taker_address`, which starts the
+   * taker's window. A legacy taker may still inline `buyerArkAddress`.
+   */
+  take: { buyerArkAddress?: string };
+  /**
+   * The taker's own Ark address for this trade: its payout address when it
+   * plays the buyer role, its refund address when it plays the seller role.
+   * Authenticated by the DM sender key (not the counterparty's word).
+   */
+  taker_address: { arkAddress: string };
   /** Seller publishes the agreed escrow, its derived address, and the seller's
    * own Ark address that a refund/arbiter decision should pay if the trade fails. */
   escrow: { agreement: EscrowAgreement; address: string; refundAddress: string };
@@ -72,8 +81,19 @@ export interface TradePayloads {
    * A party's own Ark payout address, sent to the arbiter and authenticated by
    * the DM sender key. The arbiter only pays addresses confirmed this way; it
    * never trusts the (possibly forged) addresses carried by a `dispute`.
+   *
+   * The agreement is optional: a party that states its address to the
+   * counterparty (before the escrow agreement exists) sends it without one,
+   * and the receiver still trusts it because the DM author is the claimant.
    */
-  ark_address: { agreement: EscrowAgreement; arkAddress: string };
+  ark_address: { agreement?: EscrowAgreement; arkAddress: string };
+  /**
+   * A solver asks a party for its authenticated Ark payout address during a
+   * dispute. Solvers never learn the parties' addresses before a dispute, so
+   * they request them here and each party answers with `ark_address` (signed by
+   * its own key).
+   */
+  ark_address_request: { reason?: string };
   /**
    * A party escalates to the solvers. Carries the agreement so solvers can
    * rebuild the escrow, plus both Ark payout addresses as hints. The solver
@@ -107,7 +127,7 @@ export interface TradePayloads {
 /** All message type discriminants. */
 export const TRADE_TYPES = [
   "take",
-  "payment_details",
+  "taker_address",
   "escrow",
   "funded",
   "fiat_sent",
@@ -117,6 +137,7 @@ export const TRADE_TYPES = [
   "cancel_request",
   "cancel_agree",
   "ark_address",
+  "ark_address_request",
   "dispute",
   "dispute_taken",
   "arbiter_decision",

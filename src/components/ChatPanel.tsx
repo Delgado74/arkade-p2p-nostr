@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import "./ChatPanel.css";
 import type { Identity } from "../lib/identity";
 import type { NostrClient } from "../lib/nostr";
@@ -43,6 +43,8 @@ interface Props {
   operations: OperationRecord[];
   readMarks: ReadMarks;
   onReadMarksChange: (marks: ReadMarks) => void;
+  /** Order whose conversation should be opened (e.g. from the trade panel). */
+  focusOrderId?: string | null;
   label?: PeerLabel;
 }
 
@@ -57,12 +59,15 @@ function shortKey(key: string): string {
  * Status line of a dispute room. Takes a `peer` reader so solver/initiator
  * keys show as their local pseudonym instead of a raw prefix.
  */
-function disputeStatusLine(room: DisputeRoom, peer: (key: string) => string): string {
+function disputeStatusLine(
+  room: DisputeRoom,
+  peer: (key: string, orderId?: string) => string,
+): string {
   if (room.status === "settled") return "resuelta · pagada al comprador";
   if (room.status === "refunded") return "resuelta · reembolsada al vendedor";
   if (room.status === "canceled") return "cancelada";
   if (room.status === "in-progress") {
-    return room.winner ? `en curso · solver ${peer(room.winner)}` : "en curso";
+    return room.winner ? `en curso · solver ${peer(room.winner, room.orderId)}` : "en curso";
   }
   return room.reason ? `abierta · ${room.reason}` : "abierta";
 }
@@ -167,10 +172,14 @@ export function ChatPanel({
   operations,
   readMarks,
   onReadMarksChange,
+  focusOrderId,
   label,
 }: Props) {
   const [segment, setSegment] = useState<Segment>("mensajes");
   const [openRoom, setOpenRoom] = useState<OpenRoom>(null);
+  // Focus dismissed by the user pressing "back": the room is closed but the
+  // focus stays, so it does not reopen on the next render.
+  const [dismissedFocus, setDismissedFocus] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   // Recipient selected inside a dispute room (a solver talks to each party
   // separately; a party talks to the solver that took the dispute).
@@ -178,7 +187,8 @@ export function ChatPanel({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  const peer = (key: string) => label?.(key, shortKey(key)) ?? shortKey(key);
+  const peer = (key: string, orderId?: string) =>
+    label?.(key, shortKey(key), orderId) ?? shortKey(key);
 
   const conversations = useMemo(
     () => buildConversations(feed, identity.pubkeyHex, readMarks),
@@ -205,20 +215,46 @@ export function ChatPanel({
     (c) => !c.disputeOnly && isOurTradeConversation(c, feed, operations, identity.pubkeyHex),
   );
 
+  // The room shown: either the one the user opened by tapping a conversation,
+  // or the one of the operation the user came from (trade panel).
+  //
+  // A conversation only exists once a human `chat` DM has been exchanged. When
+  // the user lands here from the trade panel before writing anything (e.g. to
+  // agree on payment details), synthesize an empty room for the focused order
+  // so the composer opens and the first message can be sent.
+  const focusConv = useMemo<Conversation | null>(() => {
+    if (!focusOrderId || focusOrderId === dismissedFocus) return null;
+    const existing = conversations.find((c) => c.orderId === focusOrderId);
+    if (existing) return existing;
+    const op = operations.find((o) => o.orderId === focusOrderId);
+    const peer = op?.counterparty || orderPeers(focusOrderId, feed, identity.pubkeyHex)[0] || "";
+    if (!peer) return null;
+    return {
+      key: `order:${focusOrderId}:${peer}`,
+      orderId: focusOrderId,
+      peer,
+      messages: [],
+      unread: 0,
+      disputeOnly: false,
+    };
+  }, [focusOrderId, dismissedFocus, conversations, operations, feed, identity.pubkeyHex]);
+  const room: OpenRoom =
+    openRoom ?? (focusConv ? { segment: "mensajes", key: focusConv.key } : null);
+
   // While a room is open its own badge stays at zero without touching storage.
-  const unreadOf = (key: string, unread: number) =>
-    openRoom?.key === key ? 0 : unread;
+  const unreadOf = (key: string, unread: number) => (room?.key === key ? 0 : unread);
   const mensajesUnread = messageConvs.reduce(
     (sum, c) => sum + unreadOf(c.key, c.unread),
     0,
   );
   const disputasUnread = disputes.reduce((sum, d) => sum + unreadOf(`dispute:${d.orderId}`, d.unread), 0);
 
-  const openConv = openRoom?.segment === "mensajes"
-    ? conversations.find((c) => c.key === openRoom.key) ?? null
+  const openConv = room?.segment === "mensajes"
+    ? (conversations.find((c) => c.key === room.key) ??
+      (focusConv && room.key === focusConv.key ? focusConv : null))
     : null;
-  const openDispute = openRoom?.segment === "disputas"
-    ? disputes.find((d) => `dispute:${d.orderId}` === openRoom.key) ?? null
+  const openDispute = room?.segment === "disputas"
+    ? disputes.find((d) => `dispute:${d.orderId}` === room.key) ?? null
     : null;
 
   // Peers a dispute message can be addressed to, and the currently selected
@@ -231,13 +267,16 @@ export function ChatPanel({
       ? disputePeer
       : (disputePeerOptions[0] ?? null);
 
-  function markRead(key: string, messages: ChatMessage[]) {
-    const last = messages[messages.length - 1];
-    if (!last) return;
-    const current = readMarks[key] ?? 0;
-    if (last.ts <= current) return;
-    onReadMarksChange({ ...readMarks, [key]: last.ts });
-  }
+  const markRead = useCallback(
+    (key: string, messages: ChatMessage[]) => {
+      const last = messages[messages.length - 1];
+      if (!last) return;
+      const current = readMarks[key] ?? 0;
+      if (last.ts <= current) return;
+      onReadMarksChange({ ...readMarks, [key]: last.ts });
+    },
+    [readMarks, onReadMarksChange],
+  );
 
   function openChat(conv: Conversation) {
     markRead(conv.key, conv.messages);
@@ -257,7 +296,16 @@ export function ChatPanel({
     setOpenRoom(null);
     setDraft("");
     setError("");
+    if (focusOrderId) setDismissedFocus(focusOrderId);
   }
+
+  // Mark as read the conversation the user was sent to from the trade panel
+  // (e.g. to exchange the concrete payment method details). The room itself is
+  // derived during render, so no state is set here.
+  useEffect(() => {
+    if (!focusConv) return;
+    markRead(focusConv.key, focusConv.messages);
+  }, [focusConv, markRead]);
 
   async function handleSend() {
     const text = draft.trim();
@@ -326,10 +374,12 @@ export function ChatPanel({
         data-closed={closed}
         onClick={() => openChat(conv)}
       >
-        <span className="chat-avatar">{peer(conv.peer).slice(0, 2).toUpperCase()}</span>
+        <span className="chat-avatar">
+          {peer(conv.peer, conv.orderId).slice(0, 2).toUpperCase()}
+        </span>
         <span className="chat-row-main">
           <span className="chat-row-top">
-            <span className="chat-row-title">{peer(conv.peer)}</span>
+            <span className="chat-row-title">{peer(conv.peer, conv.orderId)}</span>
             <span className="chat-row-time">
               {preview ? timeLabel(conv.messages[conv.messages.length - 1].ts) : ""}
             </span>
@@ -369,7 +419,9 @@ export function ChatPanel({
           </span>
           <span className="chat-row-context">
             {disputeStatusLine(room, peer)}
-            {room.initiator ? ` · ${byMe ? "abierta por ti" : `por ${peer(room.initiator)}`}` : ""}
+            {room.initiator
+              ? ` · ${byMe ? "abierta por ti" : `por ${peer(room.initiator, room.orderId)}`}`
+              : ""}
           </span>
           <span className="chat-row-preview">
             <span>{preview?.text ?? ""}</span>
@@ -390,7 +442,7 @@ export function ChatPanel({
   function roomTitle(): { title: string; sub: string; chip: boolean } {
     if (openConv) {
       return {
-        title: peer(openConv.peer),
+        title: peer(openConv.peer, openConv.orderId),
         sub: conversationContext(openConv, operations),
         chip: false,
       };
@@ -439,7 +491,7 @@ export function ChatPanel({
         <button
           type="button"
           className="chat-segment"
-          data-active={segment === "mensajes" && openRoom === null}
+          data-active={segment === "mensajes" && room === null}
           onClick={() => {
             setSegment("mensajes");
             goBack();
@@ -451,7 +503,7 @@ export function ChatPanel({
         <button
           type="button"
           className="chat-segment"
-          data-active={segment === "disputas" && openRoom === null}
+          data-active={segment === "disputas" && room === null}
           onClick={() => {
             setSegment("disputas");
             goBack();
@@ -462,7 +514,7 @@ export function ChatPanel({
         </button>
       </div>
 
-      {openRoom ? (
+      {room ? (
         <div className="chat-room">
           <div className="chat-room-header">
             <button type="button" className="chat-back" onClick={goBack} aria-label="Volver">
@@ -479,7 +531,8 @@ export function ChatPanel({
             <div className="chat-peer-picker">
               <span className="chat-peer-picker-label">Hablar con:</span>
               {disputePeerOptions.map((p) => {
-                const name = peerLabelIn(openDispute.orderId, p, feed) || peer(p);
+                const name =
+                  peerLabelIn(openDispute.orderId, p, feed) || peer(p, openDispute.orderId);
                 return (
                   <button
                     key={p}
@@ -506,7 +559,8 @@ export function ChatPanel({
                 <div key={m.id} className="chat-bubble" data-own={m.outgoing}>
                   {openDispute && !m.outgoing && m.sender && (
                     <span className="chat-bubble-sender">
-                      {peerLabelIn(openDispute.orderId, m.sender, feed) || peer(m.sender)}
+                      {peerLabelIn(openDispute.orderId, m.sender, feed) ||
+                        peer(m.sender, openDispute.orderId)}
                     </span>
                   )}
                   {m.text}

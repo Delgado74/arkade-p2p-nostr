@@ -40,11 +40,13 @@ export interface Order {
   source?: string;
   bond?: number;
   geohash?: string;
-  /** Maker's Ark address to receive a timeout/dispute refund (sell orders). */
-  arkRefundAddress?: string;
-  /** Buyer-maker's Ark address to receive the released sats (buy orders). */
-  arkReceiveAddress?: string;
   platform: string;
+  /**
+   * Ark address declared by the maker: its payout address when the maker is
+   * the buyer, its refund address when the maker is the seller. It is
+   * mandatory for both kinds of order.
+   */
+  arkAddress?: string;
   event: Event;
 }
 
@@ -66,10 +68,8 @@ export interface OrderTemplate {
   source?: string;
   bond?: number;
   geohash?: string;
-  /** Maker's Ark refund address, published so takers/arbiters can refund them. */
-  arkRefundAddress?: string;
-  /** Buyer-maker's Ark receive address, published so the seller knows where to release. */
-  arkReceiveAddress?: string;
+  /** Ark address of the maker: payout when it buys, refund when it sells. */
+  arkAddress?: string;
 }
 
 function tag(event: Event, name: string): string | undefined {
@@ -127,12 +127,11 @@ export function buildOrderTemplate(template: OrderTemplate): EventTemplate {
 
   const methods = template.paymentMethods.map((m) => m.trim()).filter(Boolean);
   if (methods.length > 0) tags.push(["pm", ...methods]);
+  if (template.arkAddress) tags.push(["ark", template.arkAddress]);
   if (template.name) tags.push(["name", template.name]);
   if (template.source) tags.push(["source", template.source]);
   if (template.bond !== undefined) tags.push(["bond", String(template.bond)]);
   if (template.geohash) tags.push(["g", template.geohash]);
-  if (template.arkRefundAddress) tags.push(["ark_refund", template.arkRefundAddress]);
-  if (template.arkReceiveAddress) tags.push(["ark_receive", template.arkReceiveAddress]);
 
   return { kind: ORDER_KIND, created_at: Math.floor(Date.now() / 1000), tags, content: "" };
 }
@@ -191,9 +190,8 @@ export function parseOrder(event: Event): Order | null {
     source: tag(event, "source"),
     bond: num(tag(event, "bond")),
     geohash: tag(event, "g"),
-    arkRefundAddress: tag(event, "ark_refund"),
-    arkReceiveAddress: tag(event, "ark_receive"),
     platform: tag(event, "y") ?? "unknown",
+    arkAddress: tag(event, "ark"),
     event,
   };
 }
@@ -404,4 +402,103 @@ export function pickDisputeTakeTaker(takes: DisputeTake[]): DisputeTake | null {
     if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
     return a.event.id < b.event.id ? -1 : 1;
   })[0];
+}
+
+/* ------------------------------------------------------------------ */
+/* Reputation (peer ratings)                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Addressable reputation event kind (same as Mostro's `NOSTR_RATING_EVENT_KIND`).
+ *
+ * Unlike Mostro, which publishes an *aggregate* snapshot signed by the central
+ * daemon, we publish one *individual* rating per (rater, order) signed by the
+ * rater. Viewers aggregate locally: a pubkey's reputation is the average and
+ * count of the ratings it has received. Because there is no daemon, all
+ * verification is reconstructed from public events (see `lib/reputation.ts`).
+ */
+export const RATING_KIND = 38384;
+
+/** Lowest star value a rater may leave. */
+export const RATING_MIN = 1;
+/** Highest star value a rater may leave. */
+export const RATING_MAX = 5;
+
+/** A parsed peer rating. */
+export interface Rating {
+  /** The pubkey being rated. */
+  ratee: string;
+  /** The pubkey that left the rating. */
+  rater: string;
+  /** Star value, clamped to `[RATING_MIN, RATING_MAX]`. */
+  value: number;
+  /** Which side of the trade the *rater* was on. */
+  role: "buyer" | "seller";
+  /** The order this rating refers to (`d`/`e`). */
+  orderId: string;
+  createdAt: number;
+  event: Event;
+}
+
+/** True when `value` is an integer within the allowed star range. */
+export function isValidRatingValue(value: number): boolean {
+  return Number.isInteger(value) && value >= RATING_MIN && value <= RATING_MAX;
+}
+
+/**
+ * Addressable `d` tag for a rating: one rating per (rater, order). `ratee`
+ * is included so both parties can rate the same order without colliding.
+ */
+export function ratingKey(orderId: string, ratee: string): string {
+  return `${orderId}:${ratee}`;
+}
+
+/** Build the template for leaving a 1-5 star rating on a finished trade. */
+export function buildRatingTemplate(params: {
+  orderId: string;
+  orderEventId: string;
+  ratee: string;
+  value: number;
+  role: "buyer" | "seller";
+}): EventTemplate {
+  if (!isValidRatingValue(params.value)) {
+    throw new Error(`rating fuera de rango: ${params.value}`);
+  }
+  return {
+    kind: RATING_KIND,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [
+      ["d", ratingKey(params.orderId, params.ratee)],
+      ["e", params.orderEventId],
+      ["p", params.ratee],
+      ["rating", String(params.value)],
+      ["role", params.role],
+      ["y", PLATFORM],
+      ["z", "rating"],
+    ],
+    content: "",
+  };
+}
+
+/** Parse a reputation event, returning null when it is malformed. */
+export function parseRating(event: Event): Rating | null {
+  if (event.kind !== RATING_KIND) return null;
+  const ratee = tag(event, "p");
+  // `d` is `<orderId>:<ratee>` (see `ratingKey`); keep only the order id.
+  const orderId = tag(event, "d")?.split(":")[0];
+  const ratingRaw = tag(event, "rating");
+  const roleRaw = tag(event, "role");
+  if (!ratee || !orderId || !ratingRaw) return null;
+  if (roleRaw !== "buyer" && roleRaw !== "seller") return null;
+  const value = Number(ratingRaw);
+  if (!isValidRatingValue(value)) return null;
+  return {
+    ratee: ratee.toLowerCase(),
+    rater: event.pubkey.toLowerCase(),
+    value,
+    role: roleRaw,
+    orderId,
+    createdAt: event.created_at,
+    event,
+  };
 }

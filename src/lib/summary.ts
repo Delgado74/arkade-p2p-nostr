@@ -4,9 +4,11 @@ import type { TradeMessage } from "./trade";
 export function summarize(msg: TradeMessage): string {
   switch (msg.type) {
     case "take":
-      return `toma la orden → paga a ${msg.payload.buyerArkAddress.slice(0, 16)}…`;
-    case "payment_details":
-      return `datos de pago (${msg.payload.methods.join(", ") || "métodos"}): ${msg.payload.details}`;
+      return msg.payload.buyerArkAddress
+        ? `toma la orden`
+        : "toma la orden";
+    case "taker_address":
+      return `dirección Ark del taker: ${msg.payload.arkAddress.slice(0, 16)}…`;
     case "escrow":
       return `acuerdo ${msg.payload.agreement.tradeSats} sats / ${msg.payload.agreement.fiatAmount} ${msg.payload.agreement.fiat}`;
     case "funded":
@@ -25,6 +27,8 @@ export function summarize(msg: TradeMessage): string {
       return `acepta la cancelación${msg.payload.reason ? `: ${msg.payload.reason}` : ""}`;
     case "ark_address":
       return `dirección Ark: ${msg.payload.arkAddress.slice(0, 16)}…`;
+    case "ark_address_request":
+      return "el solver pide tu dirección Ark";
     case "dispute":
       return `disputa al árbitro: ${msg.payload.reason}`;
     case "dispute_taken":

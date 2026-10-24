@@ -1,7 +1,6 @@
 import {
   BookIcon,
   BoltIcon,
-  ChartIcon,
   ChatIcon,
   CloseIcon,
   KeyIcon,
@@ -110,11 +109,12 @@ export function Sidebar({
           <button
             type="button"
             className="nav-row"
+            style={{ display: "none" }}
             data-active={active === "rates"}
             onClick={() => onNavigate("rates")}
           >
-            <ChartIcon />
-            <span>Tasas</span>
+            <span className="nav-icon">💱</span>
+            <span className="nav-label">Tasas</span>
           </button>
           <button
             type="button"

@@ -3,6 +3,8 @@ import { nip19 } from "nostr-tools";
 import { isExpired, type Order, type OrderType } from "../lib/protocol";
 import type { NostrClient } from "../lib/nostr";
 import type { Identity } from "../lib/identity";
+import { ReputationBadge } from "./ReputationBadge";
+import { fetchRate } from "../lib/rates";
 
 interface Props {
   client: NostrClient;
@@ -60,6 +62,23 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [quotes, setQuotes] = useState<Record<string, any>>({});
+
+  useEffect(() => {
+    const fiats = new Set<string>();
+    for (const o of orders) {
+      const f = o.fiat?.toUpperCase();
+      if (f) fiats.add(f);
+    }
+    for (const f of fiats) {
+      if (quotes[f]) continue;
+      fetchRate(f)
+        .then((q) => setQuotes((prev) => ({ ...prev, [f]: q })))
+        .catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orders]);
+
   // Newest `created_at` seen per addressable order, so a late/duplicate event
   // cannot resurrect an order that has since been taken or deleted.
   const latestRef = useRef<Map<string, number>>(new Map());
@@ -154,17 +173,20 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
   }
 
   function confirmTake(order: Order) {
-    if (side === "buy") {
-      const address = arkInput.trim();
-      if (!address) {
-        setError("Indica la dirección Ark donde recibirás los fondos.");
-        return;
-      }
-      setError("");
-      onTake?.(order, address);
-    } else {
-      onTake?.(order);
+    // The taker always states the Ark address it uses in this operation: its
+    // payout address when it takes the role of buyer, its refund address when
+    // it takes the role of seller.
+    const address = arkInput.trim();
+    if (!address) {
+      setError(
+        side === "buy"
+          ? "Indica la dirección Ark donde recibirás los fondos."
+          : "Indica la dirección Ark donde quieres recibir el reembolso.",
+      );
+      return;
     }
+    setError("");
+    onTake?.(order, address);
     hideOrder(order);
   }
 
@@ -218,6 +240,27 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
                   </div>
                   <div className="order-price">
                     {order.fiatAmount} {order.fiat}
+                    {(() => {
+                      try {
+                        const f = order.fiat?.toUpperCase();
+                        const q = f ? quotes[f] : null;
+                        if (!q || !q.usdPerBtc) return null;
+                        const premium = Number(order.premium) || 0;
+                        if (f === "USD") {
+                          const usdPerBtcWithPremium = q.fiatPerBtc * (1 + premium / 100);
+                          return <span className="order-premium">{Math.round(usdPerBtcWithPremium).toLocaleString()} USD/BTC</span>;
+                        }
+                        const marketFiatPerUsd = q.fiatPerBtc / q.usdPerBtc;
+                        const fiatPerUsdWithPremium = marketFiatPerUsd * (1 + premium / 100);
+                        return (
+                          <span className="order-premium">
+                            {fiatPerUsdWithPremium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} {order.fiat}/USD
+                          </span>
+                        );
+                      } catch {
+                        return null;
+                      }
+                    })()}
                     <span className="order-premium">prima {order.premium}%</span>
                   </div>
                 </div>
@@ -235,7 +278,10 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
               </div>
 
               <div className="order-foot">
-                <span>maker {shortNpub(order.maker)}</span>
+                <span>
+                  maker {shortNpub(order.maker)}{" "}
+                  <ReputationBadge client={client} pubkey={order.maker} hideWhenEmpty />
+                </span>
                 <span>{expiryLabel(order)}</span>
               </div>
 
@@ -254,21 +300,24 @@ export function OrderBook({ client, identity, onTake, refreshSignal }: Props) {
 
               {onTake && !isOwn && (
                 <div className="order-actions">
-                  {!buyerTakes && (
-                    <button type="button" className="btn btn-sell" onClick={() => confirmTake(order)}>
-                      Vender BTC
+                  {takingKey !== key && (
+                    <button
+                      type="button"
+                      className={buyerTakes ? "btn btn-buy" : "btn btn-sell"}
+                      onClick={() => setTakingKey(key)}
+                    >
+                      {buyerTakes ? "Comprar BTC" : "Vender BTC"}
                     </button>
                   )}
-                  {buyerTakes && takingKey !== key && (
-                    <button type="button" className="btn btn-buy" onClick={() => setTakingKey(key)}>
-                      Comprar BTC
-                    </button>
-                  )}
-                  {buyerTakes && takingKey === key && (
+                  {takingKey === key && (
                     <div className="take-form">
                       <input
                         className="input"
-                        placeholder="tu dirección Ark para recibir los sats"
+                        placeholder={
+                          buyerTakes
+                            ? "tu dirección Ark para recibir los sats"
+                            : "tu dirección Ark para el reembolso"
+                        }
                         value={arkInput}
                         onChange={(e) => setArkInput(e.target.value)}
                       />

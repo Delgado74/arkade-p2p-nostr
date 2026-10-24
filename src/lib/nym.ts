@@ -8,6 +8,14 @@
  *   hash          = SHA-256(pubkey_bytes)
  *   adjective_idx = hash[0] % 64
  *   noun_idx      = hash[1] % 64
+ *
+ * Mostro gets its per-operation aliases for free because every order runs on
+ * an ephemeral trade key. We keep one identity, so the operation is mixed
+ * into the digest instead: the same peer shows a different alias in every
+ * operation, and the alias stays stable inside one of them.
+ *
+ *   hash = SHA-256(orderId_bytes || pubkey_bytes)   (when an order is known)
+ *   hash = SHA-256(pubkey_bytes)                    (no operation context)
  */
 
 /** Adjective pool (64 entries, index 0–63). Must match `nym.rs`. */
@@ -58,30 +66,39 @@ function normalize(pubkeyHex: string): string | null {
 const resolved = new Map<string, string>();
 const pending = new Map<string, Promise<string>>();
 
-async function digest(pubkeyHex: string): Promise<string> {
+/** Cache key: the operation scope plus the key it applies to. */
+function scopeKey(pubkeyHex: string, orderId?: string): string {
+  return `${orderId ?? ""}|${pubkeyHex}`;
+}
+
+async function digest(pubkeyHex: string, orderId?: string): Promise<string> {
   const bytes = hexToBytes(pubkeyHex);
-  const buffer = bytes.buffer.slice(
-    bytes.byteOffset,
-    bytes.byteOffset + bytes.byteLength,
-  ) as ArrayBuffer;
-  const hash = await crypto.subtle.digest("SHA-256", buffer);
+  // The operation id is prefixed as UTF-8 bytes; without an operation the
+  // digest stays the plain pubkey hash, so a key shown outside any operation
+  // keeps one stable alias.
+  const prefix = orderId ? new TextEncoder().encode(orderId) : new Uint8Array(0);
+  const input = new Uint8Array(prefix.length + bytes.length);
+  input.set(prefix, 0);
+  input.set(bytes, prefix.length);
+  const hash = await crypto.subtle.digest("SHA-256", input.buffer);
   return nymFromHash(new Uint8Array(hash));
 }
 
 /** Compute and cache a pubkey's pseudonym. Resolves to the alias. */
-export async function resolveNym(pubkeyHex: string): Promise<string> {
+export async function resolveNym(pubkeyHex: string, orderId?: string): Promise<string> {
   const hex = normalize(pubkeyHex);
   if (!hex) return "";
-  const done = resolved.get(hex);
+  const key = scopeKey(hex, orderId);
+  const done = resolved.get(key);
   if (done) return done;
-  let inFlight = pending.get(hex);
+  let inFlight = pending.get(key);
   if (!inFlight) {
-    inFlight = digest(hex).then((nym) => {
-      resolved.set(hex, nym);
-      pending.delete(hex);
+    inFlight = digest(hex, orderId).then((nym) => {
+      resolved.set(key, nym);
+      pending.delete(key);
       return nym;
     });
-    pending.set(hex, inFlight);
+    pending.set(key, inFlight);
   }
   return inFlight;
 }
@@ -95,9 +112,9 @@ export async function primeNyms(pubkeys: Iterable<string>): Promise<void> {
  * Synchronous alias lookup: the pseudonym when already resolved, otherwise
  * `null`. Render code pairs this with a generic label until the value lands.
  */
-export function cachedNym(pubkeyHex: string): string | null {
+export function cachedNym(pubkeyHex: string, orderId?: string): string | null {
   const hex = normalize(pubkeyHex);
-  return hex ? resolved.get(hex) ?? null : null;
+  return hex ? resolved.get(scopeKey(hex, orderId)) ?? null : null;
 }
 
 /**
@@ -105,6 +122,6 @@ export function cachedNym(pubkeyHex: string): string | null {
  * until then it falls back to `fallback` (a generic label by default) so the
  * raw key is never shown.
  */
-export function peerLabel(pubkeyHex: string, fallback = "Anónimo"): string {
-  return cachedNym(pubkeyHex) ?? fallback;
+export function peerLabel(pubkeyHex: string, fallback = "Anónimo", orderId?: string): string {
+  return cachedNym(pubkeyHex, orderId) ?? fallback;
 }

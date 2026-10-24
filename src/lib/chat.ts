@@ -99,15 +99,27 @@ export function peerOf(dm: DirectMessage, myPubKey: string): string {
 }
 
 /**
- * Message types whose rooms belong to the Disputas segment.
- *
- * `ark_address` is deliberately excluded: parties advertise their payout
- * addresses when the escrow is agreed, long before any dispute exists, so it
- * must not spawn a dispute room (nor mark the conversation as dispute-only).
+ * Message types that represent actual peer-to-peer chat between humans.
+ * Everything else is a protocol/state message handled by the trade flow and
+ * must not pollute the "Mensajes" peer conversation list.
  */
-const DISPUTE_TYPES = new Set(["dispute", "dispute_taken", "arbiter_decision"]);
+const PEER_CHAT_TYPES = new Set(["chat"]);
 
 function toChatMessage({ dm, msg }: TradeDm): ChatMessage {
+  // Only real human chat appears as a peer message. Protocol messages (take,
+  // taker_address, escrow, funded, release_*, cancel_*, dispute_*, arbiter_decision,
+  // ark_address_request, etc.) are handled by the trade UI and must not be
+  // rendered as conversation bubbles between peers.
+  if (msg && !PEER_CHAT_TYPES.has(msg.type)) {
+    return {
+      id: dm.id,
+      ts: dm.createdAt,
+      outgoing: dm.outgoing,
+      sender: dm.sender,
+      text: summarize(msg),
+      system: true,
+    };
+  }
   return {
     id: dm.id,
     ts: dm.createdAt,
@@ -126,10 +138,8 @@ function byTs(a: ChatMessage, b: ChatMessage): number {
   return a.ts - b.ts;
 }
 
-/**
- * Group the DM feed into conversations: one per (order, peer) pair, plus bare
- * peer rooms for DMs that carry no trade message.
- */
+/** Message types whose rooms belong to the Disputas segment. */
+const DISPUTE_TYPES = new Set(["dispute", "dispute_taken", "arbiter_decision"]);
 export function buildConversations(
   feed: TradeDm[],
   myPubKey: string,
@@ -138,6 +148,10 @@ export function buildConversations(
   const rooms = new Map<string, { orderId: string; peer: string; entries: TradeDm[] }>();
   for (const entry of feed) {
     const { dm, msg } = entry;
+    // Only human chat DMs between peers belong to the "Mensajes" list.
+    // Protocol messages are handled inside the trade/dispute UI and must not
+    // create peer-to-peer conversation rows.
+    if (msg && !PEER_CHAT_TYPES.has(msg.type)) continue;
     const peer = peerOf(dm, myPubKey);
     const orderId = msg?.orderId ?? "";
     const key = orderId ? `order:${orderId}:${peer}` : `dm:${peer}`;
@@ -151,9 +165,8 @@ export function buildConversations(
     const messages = room.entries
       .map(toChatMessage)
       .sort(byTs);
-    const disputeOnly = room.entries.every(
-      (e) => e.msg !== null && DISPUTE_TYPES.has(e.msg.type),
-    );
+    // After filtering to only human chat, nothing can be dispute-only.
+    const disputeOnly = false;
     conversations.push({
       key,
       orderId: room.orderId,
@@ -287,6 +300,10 @@ export function buildDisputeRooms(
       continue;
     }
 
+    // A resolved dispute leaves no room behind: like a finished operation, its
+    // private thread is wiped once the outcome is published.
+    if (resolution) continue;
+
     const messages: ChatMessage[] = [];
     if (announce) {
       const byMe = announce.initiator.toLowerCase() === myPubKey.toLowerCase();
@@ -310,33 +327,19 @@ export function buildDisputeRooms(
         ),
       );
     }
-    if (resolution) {
-      const label =
-        resolution.status === "settled"
-          ? "pagada al comprador"
-          : resolution.status === "refunded"
-            ? "reembolsada al vendedor"
-            : resolution.status;
-      messages.push(
-        systemLine(
-          `Disputa resuelta: ${label}${resolution.arkTxid ? ` (${short(resolution.arkTxid)})` : ""}`,
-          resolution.createdAt,
-          `system:resolution:${resolution.event.id}`,
-        ),
-      );
-    }
     for (const entry of feed) {
       if (entry.msg?.orderId === orderId) messages.push(toChatMessage(entry));
     }
     messages.sort(byTs);
 
     const key = `dispute:${orderId}`;
-    const status: DisputeStatus =
-      resolution?.status ?? (winner ? "in-progress" : (announce?.status ?? "initiated"));
+    // A room only exists while the dispute is open: resolved ones are dropped
+    // above, so the status is always one of the live ones.
+    const status: DisputeStatus = winner ? "in-progress" : (announce?.status ?? "initiated");
     rooms.push({
       orderId,
       status,
-      open: resolution === null,
+      open: true,
       initiator,
       reason: announce?.reason,
       winner: winner?.solverPubKey,
