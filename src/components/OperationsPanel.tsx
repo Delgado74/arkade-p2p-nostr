@@ -55,7 +55,7 @@ export function OperationsPanel({ operations, onOpen, label, client, identity, o
     // Rating makes sense only for trades that actually completed with a
     // counterparty. The public order event is resolved on demand when missing.
     const canRate =
-      (op.status === "completed" || op.status === "arbiter-release" || op.status === "arbiter-refund") &&
+      op.status === "completed" &&
       Boolean(op.counterparty);
     return (
       <li className="op-card" key={op.orderId} data-finished={finished}>

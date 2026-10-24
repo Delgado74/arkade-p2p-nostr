@@ -318,6 +318,10 @@ export function TradePanel({
   const arbiterDecision = lastOf("arbiter_decision");
   const disputeTakenMsg = lastOf("dispute_taken");
   const releaseDone = lastOf("release_done");
+  const incomingArkRequest = useMemo(
+    () => relevant.find((e) => e.msg?.type === "ark_address_request" && !e.dm.outgoing),
+    [relevant],
+  );
 
   // Recover both parties' Ark payout addresses from the persisted DMs, so
   // reopening an operation (or a panel opened from Operación/Historial) never
@@ -1014,7 +1018,27 @@ export function TradePanel({
           sendTo(party, "ark_address_request", { reason: "disputa en curso" }),
         ),
       );
-      setStatus(`Pedidas las direcciones Ark a ${parties.length} parte(s).`);
+      setStatus(`Pedidas las direcciones Ark a ${parties.length} parte(s). Abre el chat para hablar con ellos.`);
+    });
+  }
+
+  function handleSendArkAddressToSolver() {
+    if (!identity) throw new Error("sin identidad");
+    if (!agreement) throw new Error("sin acuerdo");
+    const solver =
+      disputeTakenMsg?.payload?.solverPubKey ||
+      (disputeMsg?.payload as any)?.solverPubKey ||
+      agreement.arbiterPubKeys?.[0];
+    if (!solver) throw new Error("no hay solver");
+    const addr = myArk.trim();
+    if (!addr) throw new Error("indica tu dirección Ark");
+    run(async () => {
+      await sendTo(solver, "ark_address", {
+        arkAddress: addr,
+        agreement,
+      });
+      setStatus("Dirección Ark enviada al solver.");
+      onOpenChat?.(solver);
     });
   }
 
@@ -1024,16 +1048,23 @@ export function TradePanel({
    * arrived, in which case the arbiter must not pay that party.
    */
   function authenticatedAddress(partyRole: TradeRole): string | null {
-    const agr = disputeMsg?.payload.agreement;
+    const agr = disputeMsg?.payload.agreement ?? agreement;
     if (!agr) return null;
     const pub = (partyRole === "buyer" ? agr.buyerPubKey : agr.sellerPubKey).toLowerCase();
-    const claim = relevant.find(
-      (e) =>
-        e.msg?.type === "ark_address" &&
-        !e.dm.outgoing &&
-        e.msg.from.toLowerCase() === pub,
-    );
-    if (!claim || !claim.msg || claim.msg.type !== "ark_address") return null;
+    const claim =
+      relevant.find(
+        (e) =>
+          e.msg?.type === "ark_address" &&
+          !e.dm.outgoing &&
+          (e.msg.from?.toLowerCase() === pub || e.dm.sender?.toLowerCase() === pub),
+      ) ||
+      feed.find(
+        (e) =>
+          e.msg?.type === "ark_address" &&
+          !e.dm.outgoing &&
+          (e.msg.from?.toLowerCase() === pub || e.dm.sender?.toLowerCase() === pub),
+      );
+    if (!claim?.msg || claim.msg.type !== "ark_address") return null;
     // A claim may arrive without an agreement (the buyer states its address
     // to the seller before the escrow exists). The DM author is what
     // authenticates it, so the agreement is only checked when it is there.
@@ -1041,7 +1072,9 @@ export function TradePanel({
     if (a && (a.buyerPubKey !== agr.buyerPubKey || a.sellerPubKey !== agr.sellerPubKey)) {
       return null;
     }
-    return claim.msg.payload.arkAddress.trim() || null;
+    const addr = claim.msg.payload.arkAddress;
+    if (typeof addr !== "string") return null;
+    return addr.trim() || null;
   }
 
   /**
@@ -1616,6 +1649,20 @@ export function TradePanel({
             </p>
           )}
         </div>
+      )}
+      {!isSolver && incomingArkRequest && agreement && (
+        <section className="panel" style={{ border: "1px solid var(--accent)", background: "rgba(255,200,0,0.08)" }}>
+          <h3>El solver solicita tu dirección Ark</h3>
+          <p className="muted">Para poder resolver la disputa, envía tu dirección Ark autenticada al solver.</p>
+          <div className="actions">
+            <button className="btn btn-buy" onClick={handleSendArkAddressToSolver} disabled={busy || !myArk.trim()}>
+              Enviar dirección Ark al solver
+            </button>
+            <button className="btn btn-ghost" onClick={() => onOpenChat?.(disputeTakenMsg?.payload?.solverPubKey || (disputeMsg?.payload as any)?.solverPubKey || agreement.arbiterPubKeys?.[0] || "")}>
+              Abrir chat con el solver
+            </button>
+          </div>
+        </section>
       )}
       {isSolver && !disputeMsg && <p>Sin disputas entrantes.</p>}
       {disputeTakenMsg && disputeTakenMsg.payload.solverPubKey.toLowerCase() !== (identity?.pubkeyHex.toLowerCase() ?? "") && (
