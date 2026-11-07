@@ -1,5 +1,4 @@
 import { SimplePool } from "nostr-tools/pool";
-import { finalizeEvent } from "nostr-tools/pure";
 import type { Event, EventTemplate } from "nostr-tools/pure";
 import type { Filter } from "nostr-tools/filter";
 import {
@@ -28,6 +27,7 @@ import {
   type Rating,
 } from "./protocol";
 import type { Identity } from "./identity";
+import { daemonClient } from "./daemon/client";
 
 /** NIP-09 event kind used to request deletion of an order. */
 export const DELETION_KIND = 5;
@@ -91,8 +91,8 @@ export class NostrClient {
   }
 
   /** Sign and publish a template; succeeds if at least one relay accepts it. */
-  async publish(template: EventTemplate, identity: Identity): Promise<Event> {
-    const event = finalizeEvent(template, identity.secretKey);
+  async publish(template: EventTemplate, _identity: Identity): Promise<Event> {
+    const event = await daemonClient.call<Event>("nostr.signEvent", { template });
     const results = await Promise.allSettled(this.pool.publish(this.relays, event));
     const accepted = results.filter((r) => r.status === "fulfilled").length;
     if (accepted === 0) {

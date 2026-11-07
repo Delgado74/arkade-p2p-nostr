@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { daemonClient } from "../lib/daemon/client";
 
 type Props = {
@@ -12,20 +12,27 @@ export default function DaemonSetup({ onReady }: Props) {
   const [showMnemonic, setShowMnemonic] = useState(false);
   const [error, setError] = useState("");
 
-  const check = async () => {
-    try {
-      await daemonClient.connect();
-      const s = await daemonClient.call<{ status: string }>("wallet.status");
-      setStatus(s.status as any);
-    } catch (e: any) {
-      setError(e.message);
-      setStatus("error");
-    }
-  };
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        await daemonClient.connect();
+        const s = await daemonClient.call<{ status: string }>("wallet.status");
+        if (!cancelled) setStatus(s.status as typeof status);
+      } catch (e: any) {
+        if (cancelled) return;
+        setError(e.message);
+        setStatus("error");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-  useState(() => {
-    check();
-  });
+  useEffect(() => {
+    if (status === "ready") onReady();
+  }, [status, onReady]);
 
   const create = async () => {
     try {
@@ -95,6 +102,5 @@ export default function DaemonSetup({ onReady }: Props) {
       </div>
     );
   }
-  onReady();
   return <div className="panel" style={{ margin: 40 }}>Listo</div>;
 }

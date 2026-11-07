@@ -1,15 +1,11 @@
 import type { SimplePool } from "nostr-tools/pool";
-import { unwrapEvent } from "nostr-tools/nip17";
-import { wrapManyEvents } from "nostr-tools/nip59";
-import type { Event, UnsignedEvent } from "nostr-tools/pure";
+import type { Event } from "nostr-tools/pure";
 import type { Filter } from "nostr-tools/filter";
 import type { Identity } from "./identity";
+import { daemonClient } from "./daemon/client";
 
 /** Gift-wrap kind used by NIP-17 private direct messages. */
 export const GIFT_WRAP_KIND = 1059;
-
-/** Inner rumor kind for NIP-17 private direct messages. */
-const PRIVATE_DM_KIND = 14;
 
 /** An unwrapped private direct message. */
 export interface DirectMessage {
@@ -34,31 +30,34 @@ export interface DmSubscription {
   close(): void;
 }
 
+interface DaemonRumor {
+  id: string;
+  sender: string;
+  recipients: string[];
+  content: string;
+  createdAt: number;
+}
+
 /**
- * Send a NIP-17 private message: seal + gift-wrap to the recipient and keep a
- * copy wrapped to self so the sender can reload their own history.
+ * Send a NIP-17 private message. The daemon builds and signs the seal and gift
+ * wraps (including the self-copy) without ever exposing its secret key.
  *
  * @returns The gift-wrapped event destined to the recipient.
  */
 export async function sendDm(
   pool: SimplePool,
   relays: string[],
-  identity: Identity,
+  _identity: Identity,
   recipientPubKey: string,
   content: string,
 ): Promise<Event> {
-  // One shared rumor whose `p` tags list BOTH parties. The self-copy keeps the
-  // recipient in the tags, so the sender can still recover the counterparty of
-  // their own outgoing messages when reloading history.
-  const rumor: Partial<UnsignedEvent> = {
-    kind: PRIVATE_DM_KIND,
+  const wraps = await daemonClient.call<Event[]>("nostr.wrapDm", {
+    recipient: recipientPubKey,
     content,
-    tags: [
-      ["p", recipientPubKey],
-      ["p", identity.pubkeyHex],
-    ],
-  };
-  const wraps = wrapManyEvents(rumor, identity.secretKey, [recipientPubKey]);
+  });
+  if (!wraps || wraps.length === 0) {
+    throw new Error("daemon returned no gift wraps");
+  }
   const results = await Promise.allSettled(wraps.flatMap((wrap) => pool.publish(relays, wrap)));
   const accepted = results.filter((r) => r.status === "fulfilled").length;
   if (accepted === 0) {
@@ -68,24 +67,22 @@ export async function sendDm(
 }
 
 /** Turn a received gift wrap into a {@link DirectMessage}, or `null` if unreadable. */
-export function openDm(wrap: Event, identity: Identity): DirectMessage | null {
+export async function openDm(wrap: Event, identity: Identity): Promise<DirectMessage | null> {
   if (wrap.kind !== GIFT_WRAP_KIND) return null;
-  let rumor;
   try {
-    rumor = unwrapEvent(wrap, identity.secretKey);
+    const rumor = await daemonClient.call<DaemonRumor>("nostr.unwrapDm", { wrap });
+    return {
+      id: rumor.id,
+      sender: rumor.sender,
+      recipients: rumor.recipients,
+      content: rumor.content,
+      createdAt: rumor.createdAt,
+      outgoing: rumor.sender === identity.pubkeyHex,
+      wrap,
+    };
   } catch {
     return null;
   }
-  const recipients = rumor.tags.filter((t) => t[0] === "p").map((t) => t[1]);
-  return {
-    id: rumor.id,
-    sender: rumor.pubkey,
-    recipients,
-    content: rumor.content,
-    createdAt: rumor.created_at,
-    outgoing: rumor.pubkey === identity.pubkeyHex,
-    wrap,
-  };
 }
 
 /** Options for {@link subscribeDms}. */
@@ -110,7 +107,8 @@ export function subscribeDms(
   identity: Identity,
   options: SubscribeDmOptions,
 ): DmSubscription {
-  const seen = new Set<string>();
+  const seenWraps = new Set<string>();
+  const seenMessages = new Set<string>();
   const filter: Filter = {
     kinds: [GIFT_WRAP_KIND],
     "#p": [identity.pubkeyHex],
@@ -118,11 +116,13 @@ export function subscribeDms(
   };
   return pool.subscribeMany(relays, filter, {
     onevent(wrap) {
-      const message = openDm(wrap, identity);
-      if (!message) return;
-      if (seen.has(message.id)) return;
-      seen.add(message.id);
-      options.onMessage(message);
+      if (seenWraps.has(wrap.id)) return;
+      seenWraps.add(wrap.id);
+      void openDm(wrap, identity).then((message) => {
+        if (!message || seenMessages.has(message.id)) return;
+        seenMessages.add(message.id);
+        options.onMessage(message);
+      });
     },
     onclose(reasons: { url: string; reason: string }[]) {
       if (options.onError && reasons.length > 0) options.onError(reasons);

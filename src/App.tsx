@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { connectArkade, type ArkContext } from "./lib/arkade";
-import { type Identity } from "./lib/identity";
+import { identityFromPubkey, type Identity } from "./lib/identity";
 import { NostrClient } from "./lib/nostr";
 import { sendDm, subscribeDms } from "./lib/dm";
 import {
@@ -88,18 +88,12 @@ export default function App() {
     if (!daemonReady || daemonIdentity) return;
     daemonClient.call<{ npub: string; pk: string }>("nostr.getIdentity")
       .then((res) => {
-        setDaemonIdentity({
-          npub: res.npub,
-          nsec: "",
-          sk: "",
-          pk: res.pk,
-          secretKey: new Uint8Array(),
-          secretHex: "",
-          pubkeyHex: res.pk,
-          ark: "",
-        } as unknown as Identity);
+        setDaemonIdentity(identityFromPubkey(res.pk));
       })
-      .catch((e) => console.error(e));
+      .catch((e) => {
+        console.error(e);
+        setDaemonReady(false);
+      });
   }, [daemonReady, daemonIdentity]);
 
   if (!daemonReady || !daemonIdentity) {

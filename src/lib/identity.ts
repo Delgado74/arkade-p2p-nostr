@@ -1,62 +1,41 @@
-import { SingleKey } from "@arkade-os/sdk";
+import type { SingleKey } from "@arkade-os/sdk";
 import { hex } from "@scure/base";
-import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { nip19 } from "nostr-tools";
 
 export interface Identity {
-  /** Raw 32-byte secp256k1 secret key. */
-  secretKey: Uint8Array;
-  /** Secret key as lowercase hex. */
-  secretHex: string;
-  /** Secret key encoded as a NIP-19 `nsec`. */
-  nsec: string;
   /** x-only public key as lowercase hex (Nostr pubkey). */
   pubkeyHex: string;
   /** Public key encoded as a NIP-19 `npub`. */
   npub: string;
-  /** Arkade signing identity backed by the same secp256k1 key. */
+  /**
+   * Arkade signer placeholder owned by the daemon.
+   *
+   * Fase 1b replaces this with an RPC-backed signer. Until then it can derive
+   * the public key but signing fails closed instead of using a browser key.
+   */
   ark: SingleKey;
 }
 
-function includeIdentity(secretKey: Uint8Array): Identity {
-  if (secretKey.length !== 32) {
-    throw new Error(`secret key must be 32 bytes, got ${secretKey.length}`);
-  }
-  const pubkeyHex = getPublicKey(secretKey);
+function pendingArkSigner(pubkeyHex: string): SingleKey {
   return {
-    secretKey,
-    secretHex: hex.encode(secretKey),
-    nsec: nip19.nsecEncode(secretKey),
-    pubkeyHex,
-    npub: nip19.npubEncode(pubkeyHex),
-    ark: SingleKey.fromPrivateKey(secretKey),
-  };
+    xOnlyPublicKey: async () => hex.decode(pubkeyHex),
+    sign: async () => {
+      throw new Error("Ark signing is not available until the daemon wallet integration (Fase 1b)");
+    },
+  } as unknown as SingleKey;
 }
 
-/** Generate a brand new identity (same key for Nostr and Arkade). */
-export function generateIdentity(): Identity {
-  return includeIdentity(generateSecretKey());
-}
-
-/** Build an identity from a raw 32-byte secret key. */
-export function identityFromSecretKey(secretKey: Uint8Array): Identity {
-  return includeIdentity(secretKey);
-}
-
-/** Build an identity from a hex-encoded secret key or an `nsec1...` string. */
-export function identityFromInput(input: string): Identity {
-  const value = input.trim();
-  if (value.length === 0) throw new Error("empty key");
-
-  if (value.startsWith("nsec1")) {
-    const decoded = nip19.decode(value);
-    if (decoded.type !== "nsec") {
-      throw new Error(`expected nsec, got ${decoded.type}`);
-    }
-    return includeIdentity(decoded.data);
+/** Build the client identity from the public key returned by the daemon. */
+export function identityFromPubkey(pubkeyHex: string): Identity {
+  const pk = pubkeyHex.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(pk)) {
+    throw new Error("expected a 64-character hex pubkey");
   }
-
-  return includeIdentity(hex.decode(value));
+  return {
+    pubkeyHex: pk,
+    npub: nip19.npubEncode(pk),
+    ark: pendingArkSigner(pk),
+  };
 }
 
 /** x-only public key (32 bytes) for a given identity, as used by tapscripts. */
