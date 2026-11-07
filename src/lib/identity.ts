@@ -1,32 +1,51 @@
-import type { SingleKey } from "@arkade-os/sdk";
-import { hex } from "@scure/base";
+import { SingleKey, Transaction } from "@arkade-os/sdk";
+import { base64, hex } from "@scure/base";
 import { nip19 } from "nostr-tools";
+import { daemonClient } from "./daemon/client";
 
 export interface Identity {
   /** x-only public key as lowercase hex (Nostr pubkey). */
   pubkeyHex: string;
   /** Public key encoded as a NIP-19 `npub`. */
   npub: string;
-  /**
-   * Arkade signer placeholder owned by the daemon.
-   *
-   * Fase 1b replaces this with an RPC-backed signer. Until then it can derive
-   * the public key but signing fails closed instead of using a browser key.
-   */
+  /** Arkade signer backed by the daemon RPC. */
   ark: SingleKey;
 }
 
-function pendingArkSigner(pubkeyHex: string): SingleKey {
+function rpcArkSigner(pubkeyHex: string, compressedPk?: string): SingleKey {
+  const session = SingleKey.fromRandomBytes().signerSession();
   return {
     xOnlyPublicKey: async () => hex.decode(pubkeyHex),
-    sign: async () => {
-      throw new Error("Ark signing is not available until the daemon wallet integration (Fase 1b)");
+    compressedPublicKey: async () => {
+      if (!compressedPk || !/^[0-9a-f]{66}$/.test(compressedPk)) {
+        throw new Error("daemon did not return a valid compressed Ark pubkey");
+      }
+      return hex.decode(compressedPk);
     },
+    sign: async (tx: Transaction, inputIndexes?: number[]) => {
+      const psbt = base64.encode(tx.toPSBT());
+      const signed = await daemonClient.call<string>("ark.signPsbt", { psbt, inputIndexes });
+      return Transaction.fromPSBT(base64.decode(signed));
+    },
+    signMessage: async (message: Uint8Array, signatureType: "schnorr" | "ecdsa" = "schnorr") => {
+      const signature = await daemonClient.call<string>("ark.signMessage", {
+        message: base64.encode(message),
+        signatureType,
+      });
+      return base64.decode(signature);
+    },
+    signSchnorrDeterministic: async (messageHash: Uint8Array) => {
+      const signature = await daemonClient.call<string>("ark.signSchnorrDeterministic", {
+        messageHash: base64.encode(messageHash),
+      });
+      return base64.decode(signature);
+    },
+    signerSession: () => session,
   } as unknown as SingleKey;
 }
 
-/** Build the client identity from the public key returned by the daemon. */
-export function identityFromPubkey(pubkeyHex: string): Identity {
+/** Build the client identity from the public keys returned by the daemon. */
+export function identityFromPubkey(pubkeyHex: string, compressedPk?: string): Identity {
   const pk = pubkeyHex.trim().toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(pk)) {
     throw new Error("expected a 64-character hex pubkey");
@@ -34,7 +53,7 @@ export function identityFromPubkey(pubkeyHex: string): Identity {
   return {
     pubkeyHex: pk,
     npub: nip19.npubEncode(pk),
-    ark: pendingArkSigner(pk),
+    ark: rpcArkSigner(pk, compressedPk?.trim().toLowerCase()),
   };
 }
 

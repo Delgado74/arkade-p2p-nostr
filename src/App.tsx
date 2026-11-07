@@ -86,9 +86,9 @@ export default function App() {
 
   useEffect(() => {
     if (!daemonReady || daemonIdentity) return;
-    daemonClient.call<{ npub: string; pk: string }>("nostr.getIdentity")
+    daemonClient.call<{ npub: string; pk: string; compressedPk?: string }>("nostr.getIdentity")
       .then((res) => {
-        setDaemonIdentity(identityFromPubkey(res.pk));
+        setDaemonIdentity(identityFromPubkey(res.pk, res.compressedPk));
       })
       .catch((e) => {
         console.error(e);
