@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { connectArkade, type ArkContext } from "./lib/arkade";
-import { generateIdentity, identityFromInput, type Identity } from "./lib/identity";
-import { loadOrCreateIdentity, saveIdentity } from "./lib/storage";
+import { type Identity } from "./lib/identity";
 import { NostrClient } from "./lib/nostr";
 import { sendDm, subscribeDms } from "./lib/dm";
 import {
@@ -34,9 +33,11 @@ import {
   saveReadMarks,
   type ReadMarks,
 } from "./lib/chat";
-// import { RatesPanel } from "./components/RatesPanel";
 import { OrderForm } from "./components/OrderForm";
 import { OrderBook } from "./components/OrderBook";
+import DaemonSetup from "./components/DaemonSetup";
+import { daemonClient } from "./lib/daemon/client";
+// import { RatesPanel } from "./components/RatesPanel";
 import { EscrowHarness } from "./components/EscrowHarness";
 import { OperationsPanel } from "./components/OperationsPanel";
 import { TradePanel, type TradeRequest } from "./components/TradePanel";
@@ -80,16 +81,42 @@ const BACK_TARGET: Partial<Record<Screen, Screen>> = {
 };
 
 export default function App() {
+  const [daemonReady, setDaemonReady] = useState(false);
+  const [daemonIdentity, setDaemonIdentity] = useState<Identity | null>(null);
+
+  useEffect(() => {
+    if (!daemonReady || daemonIdentity) return;
+    daemonClient.call<{ npub: string; pk: string }>("nostr.getIdentity")
+      .then((res) => {
+        setDaemonIdentity({
+          npub: res.npub,
+          nsec: "",
+          sk: "",
+          pk: res.pk,
+          secretKey: new Uint8Array(),
+          secretHex: "",
+          pubkeyHex: res.pk,
+          ark: "",
+        } as unknown as Identity);
+      })
+      .catch((e) => console.error(e));
+  }, [daemonReady, daemonIdentity]);
+
+  if (!daemonReady || !daemonIdentity) {
+    return <DaemonSetup onReady={() => setDaemonReady(true)} />;
+  }
+
+  return <AppMain identity={daemonIdentity} />;
+}
+
+function AppMain({ identity }: { identity: Identity }) {
   const [tab, setTab] = useState<Screen>("book");
   // Order whose chat conversation is opened on the chat screen.
   const [focusOrderId, setFocusOrderId] = useState<string | null>(null);
   const [createType, setCreateType] = useState<OrderType>("sell");
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [identity, setIdentity] = useState<Identity>(loadOrCreateIdentity);
-  const [keyInput, setKeyInput] = useState("");
   const [ctx, setCtx] = useState<ArkContext | null>(null);
   const [aspStatus, setAspStatus] = useState<AspStatus>("connecting");
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
   const [feed, setFeed] = useState<TradeDm[]>([]);
@@ -531,14 +558,6 @@ export default function App() {
     saveReadMarks(identity.pubkeyHex, next);
   }
 
-  function run<T>(fn: () => Promise<T>) {
-    setBusy(true);
-    setError("");
-    fn()
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setBusy(false));
-  }
-
   function reconnectAsp() {
     setAspStatus("connecting");
     setCtx(null);
@@ -552,13 +571,6 @@ export default function App() {
         setAspStatus("error");
         setError(e instanceof Error ? e.message : String(e));
       });
-  }
-
-  function applyIdentity(next: Identity) {
-    saveIdentity(next);
-    setIdentity(next);
-    setOperations(loadOperations(next.pubkeyHex));
-    setReadMarks(loadReadMarks(next.pubkeyHex));
   }
 
   async function handleTake(order: Order, buyerArkAddress?: string) {
@@ -789,6 +801,7 @@ export default function App() {
                 feed={visibleFeed}
                 disputeAnnounces={disputeAnnounces}
                 disputeTakes={disputeTakes}
+                solverRegistry={solverRegistry}
                 label={label}
                 onRecord={recordCurrent}
                 onOpenChat={openChatForOrder}
@@ -821,51 +834,18 @@ export default function App() {
           {screen === "account" && (
             <section className="panel">
               <p className="panel-note">
-                Tu clave se genera automáticamente y se guarda en esta pestaña. Cada pestaña o
-                ventana tiene su propia identidad (abre otra para actuar como comprador, vendedor
-                o árbitro). La misma clave sirve para Nostr y para Arkade.
+                La identidad la gestiona el daemon local: el navegador nunca recibe ni guarda la
+                clave secreta. La misma identidad sirve para Nostr y para Arkade.
               </p>
 
               <dl className="kv">
                 <dt>npub</dt>
                 <dd>{identity.npub}</dd>
-                <dt>nsec</dt>
-                <dd>{identity.nsec}</dd>
               </dl>
-
-              <div className="inline-form">
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  disabled={busy}
-                  onClick={() => run(async () => applyIdentity(generateIdentity()))}
-                >
-                  Generar otra
-                </button>
-                <input
-                  className="input"
-                  placeholder="nsec1... o hex"
-                  value={keyInput}
-                  onChange={(e) => setKeyInput(e.target.value)}
-                />
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  disabled={busy || !keyInput}
-                  onClick={() =>
-                    run(async () => {
-                      applyIdentity(identityFromInput(keyInput));
-                      setKeyInput("");
-                    })
-                  }
-                >
-                  Importar
-                </button>
-              </div>
 
               <h3>ASP</h3>
               <div className="inline-form">
-                <button type="button" className="btn btn-ghost" disabled={busy} onClick={reconnectAsp}>
+                <button type="button" className="btn btn-ghost" onClick={reconnectAsp}>
                   {aspStatus === "connecting" ? "Conectando…" : "Reconectar"}
                 </button>
                 <span className="panel-note">

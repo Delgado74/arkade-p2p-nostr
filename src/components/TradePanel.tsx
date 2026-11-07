@@ -28,6 +28,7 @@ import {
 } from "../lib/escrow";
 import { derivePersonalArkAddress } from "../lib/escrowWallet";
 import { recoverEscrowVtxos } from "../lib/recovery";
+import { validateAgreement, type AgreementValidation } from "../lib/agreement";
 import {
   encodeTradeMessage,
   TRADE_APP,
@@ -50,6 +51,7 @@ import {
   pickDisputeTakeTaker,
   type DisputeAnnounce,
   type DisputeTake,
+  type SolverRegistry,
 } from "../lib/protocol";
 
 /** Prefill produced when a taker presses "Tomar" on an order. */
@@ -90,6 +92,8 @@ interface Props {
   disputeAnnounces?: DisputeAnnounce[];
   /** Public dispute takes (kind 38387), including competing takes. */
   disputeTakes?: DisputeTake[];
+  /** Current solver registry, used to validate the escrow's solver set. */
+  solverRegistry?: SolverRegistry | null;
   /** Local pseudonym reader for pubkeys shown in the panel. */
   label?: PeerLabel;
   /**
@@ -99,7 +103,7 @@ interface Props {
    */
   onRecord?: (patch: Partial<OperationRecord>) => void;
   /** Opens the private chat with the counterparty of this operation. */
-  onOpenChat?: (orderId: string) => void;
+  onOpenChat?: (orderIdOrPubkey: string) => void;
 }
 
 /**
@@ -171,6 +175,7 @@ export function TradePanel({
   feed,
   disputeAnnounces = [],
   disputeTakes = [],
+  solverRegistry = null,
   label,
   onRecord,
   onOpenChat,
@@ -280,7 +285,7 @@ export function TradePanel({
             !entry.dm.outgoing &&
             entry.msg?.type === "dispute" &&
             entry.msg.orderId === effectiveOrderId &&
-            entry.msg.payload.agreement.arbiterPubKeys.some(
+            entry.msg.payload?.agreement?.arbiterPubKeys?.some(
               (p) => p.toLowerCase() === identity.pubkeyHex.toLowerCase(),
             ),
         )),
@@ -310,9 +315,72 @@ export function TradePanel({
   const disputeMsg = lastOf("dispute");
   // The agreement normally comes from our counterparty's `escrow` DM; a solver
   // outside the trade only receives it inside an incoming `dispute` DM.
-  const agreement = escrowMsg?.payload.agreement ?? disputeMsg?.payload.agreement ?? null;
-  const agreedAddress = escrowMsg?.payload.address ?? "";
-  const agreedRefundAddress = escrowMsg?.payload.refundAddress ?? "";
+  const agreement = escrowMsg?.payload?.agreement ?? disputeMsg?.payload?.agreement ?? null;
+  const agreedAddress = escrowMsg?.payload?.address ?? "";
+  const agreedRefundAddress = escrowMsg?.payload?.refundAddress ?? "";
+
+  // Solvers the community currently trusts. The builder falls back to
+  // VITE_ARBITER when the coordinator registry is empty, so validation uses the
+  // same set; an empty trust set fails closed.
+  const trustedSolvers = useMemo(() => {
+    const fromRegistry = (solverRegistry?.solvers ?? [])
+      .map((pubkey) => {
+        try {
+          return pubkeyFromInput(pubkey);
+        } catch {
+          return null;
+        }
+      })
+      .filter((pubkey): pubkey is string => pubkey !== null);
+    if (fromRegistry.length > 0) return fromRegistry;
+    return arbiter ? [arbiter] : [];
+  }, [solverRegistry, arbiter]);
+
+  // The parties are known from the operation context: our identity plus the
+  // counterparty, whose role is the opposite of ours. A solver only sees the
+  // agreement inside a dispute and cannot check the parties locally.
+  const expectedBuyer = solverView
+    ? undefined
+    : role === "buyer"
+      ? identity?.pubkeyHex
+      : cpPub ?? undefined;
+  const expectedSeller = solverView
+    ? undefined
+    : role === "seller"
+      ? identity?.pubkeyHex
+      : cpPub ?? undefined;
+
+  const agreementValidation = useMemo<AgreementValidation | null>(() => {
+    if (!agreement || !ctx) return null;
+    return validateAgreement(agreement, {
+      expectedServerPubKey: hex.encode(ctx.serverPubKey),
+      allowedSolvers: trustedSolvers,
+      expectedOrder: {
+        orderId: effectiveOrderId || undefined,
+        tradeSats: request?.tradeSats,
+        fiat: request?.fiat,
+        fiatAmount: request?.fiatAmount,
+      },
+      expectedBuyerPubKey: expectedBuyer,
+      expectedSellerPubKey: expectedSeller,
+      now: nowSec,
+      // Reopening a late operation must still allow release/dispute; the
+      // creation path enforces that the locktime is in the future.
+      requireFutureLocktime: false,
+    });
+  }, [
+    agreement,
+    ctx,
+    trustedSolvers,
+    effectiveOrderId,
+    request,
+    expectedBuyer,
+    expectedSeller,
+    nowSec,
+  ]);
+
+  const agreementOk = agreementValidation?.ok ?? false;
+
   const pendingRelease = lastOf("release_request");
   const fundedMsg = lastOf("funded");
   const arbiterDecision = lastOf("arbiter_decision");
@@ -383,7 +451,7 @@ export function TradePanel({
   const isSolver = Boolean(
     identity &&
       agreement &&
-      agreement.arbiterPubKeys.some((p) => p.toLowerCase() === identity.pubkeyHex.toLowerCase()),
+      agreement.arbiterPubKeys?.some((p) => p.toLowerCase() === identity.pubkeyHex.toLowerCase()),
   );
 
   // Optimistic take: earliest created_at wins, ties broken by lowest event id,
@@ -472,6 +540,17 @@ export function TradePanel({
     }
   }
 
+  // The agreement commits keys, solvers and amounts into the script. Refuse to
+  // fund or spend against an agreement that does not match the order, the
+  // connected ASP, or the trusted solver registry.
+  function requireValidAgreement(): void {
+    if (!agreement) throw new Error("aún no hay acuerdo de escrow");
+    if (!agreementValidation?.ok) {
+      const detail = agreementValidation?.errors.join("; ") ?? "no se pudo validar";
+      throw new Error(`acuerdo de escrow inválido: ${detail}`);
+    }
+  }
+
   // The release spend pays the buyer exactly `tradeSats` and has no change back
   // to the escrow, so any excess funded is lost. Funding must match exactly.
   const expectedSats = agreement?.tradeSats ?? (Number(tradeSats) > 0 ? Number(tradeSats) : null);
@@ -479,8 +558,16 @@ export function TradePanel({
   const fundingExact =
     fundedSats !== null && expectedSats !== null ? fundedSats === expectedSats : null;
 
-  const escrow: Escrow | null =
-    agreement && ctx ? escrowFromAgreement(agreement, ctx.network) : null;
+  let escrow: Escrow | null = null;
+  if (agreement && ctx) {
+    try {
+      escrow = escrowFromAgreement(agreement, ctx.network);
+    } catch {
+      // Invalid keys/terms are reported by `agreementValidation`; never let a
+      // malformed DM crash the whole panel.
+      escrow = null;
+    }
+  }
 
   // Re-render roughly once a minute so the timelock state stays current.
   // `chainSec` tracks the chain's median-time-past (what the CLTV is actually
@@ -524,9 +611,14 @@ export function TradePanel({
   // We keep polling while the VTXO is not yet spendable (preconfirmed or swept)
   // so the state can flip to "spendable" once the batch settles.
   useEffect(() => {
-    if (!ctx || !agreement || fundingKnown) return;
+    if (!ctx || !agreement || !agreementOk || fundingKnown) return;
     let cancelled = false;
-    const esc = escrowFromAgreement(agreement, ctx.network);
+    let esc: Escrow;
+    try {
+      esc = escrowFromAgreement(agreement, ctx.network);
+    } catch {
+      return;
+    }
     const poll = () => {
       listEscrowVtxos(ctx.indexer, esc)
         .then((found) => {
@@ -546,7 +638,7 @@ export function TradePanel({
       cancelled = true;
       clearInterval(timer);
     };
-  }, [ctx, agreement, fundingKnown]);
+  }, [ctx, agreement, agreementOk, fundingKnown]);
 
   // Once the funding shows up, the seller announces it to the buyer (one shot).
   useEffect(() => {
@@ -609,7 +701,7 @@ export function TradePanel({
     const key = `${request.dm.id}`;
     if (addrRepliedRef.current.has(key)) return;
     addrRepliedRef.current.add(key);
-    const agr = escrowMsg?.payload.agreement;
+    const agr = escrowMsg?.payload?.agreement;
     const msg: TradeMessageOf<"ark_address"> = {
       app: TRADE_APP,
       v: TRADE_VERSION,
@@ -661,6 +753,7 @@ export function TradePanel({
   }
 
   function handleFiatSent() {
+    requireValidAgreement();
     run(async () => {
       await send("fiat_sent", {});
       setStatus("Aviso de pago fiat enviado.");
@@ -771,6 +864,23 @@ export function TradePanel({
         serverPubKey: hex.encode(ctx.serverPubKey),
         refundLocktime: refundLocktimeFrom(chainNow).toString(),
       };
+      const check = validateAgreement(agr, {
+        expectedServerPubKey: hex.encode(ctx.serverPubKey),
+        allowedSolvers: solverSet,
+        expectedOrder: {
+          orderId: effectiveOrderId,
+          tradeSats: Number(tradeSats),
+          fiat: fiat.trim().toUpperCase(),
+          fiatAmount: Number(fiatAmount),
+        },
+        expectedBuyerPubKey: cpPub,
+        expectedSellerPubKey: identity.pubkeyHex,
+        now: chainNow,
+        requireFutureLocktime: true,
+      });
+      if (!check.ok) {
+        throw new Error(`acuerdo de escrow inválido: ${check.errors.join("; ")}`);
+      }
       const built = escrowFromAgreement(agr, ctx.network);
       await send("escrow", {
         agreement: agr,
@@ -827,6 +937,7 @@ export function TradePanel({
   function handleReleaseRequest() {
     if (!identity || !ctx) throw new Error("falta identidad o ASP");
     if (!escrow || !vtxo || !agreement) throw new Error("falta escrow fondeado o acuerdo");
+    requireValidAgreement();
     requireSpendableEscrow();
     if (fundingExact === false) {
       throw new Error(
@@ -851,6 +962,7 @@ export function TradePanel({
   function handleReleaseNow() {
     if (!identity || !ctx) throw new Error("falta identidad o ASP");
     if (!escrow || !vtxo || !agreement || !pendingRelease) throw new Error("faltan datos para liberar");
+    requireValidAgreement();
     requireSpendableEscrow();
     if (fundingExact === false) {
       throw new Error(
@@ -887,6 +999,7 @@ export function TradePanel({
     if (!escrow || !vtxo || !agreement) throw new Error("falta escrow fondeado o acuerdo");
     if (role !== "seller") throw new Error("solo el vendedor puede reclamar el reembolso");
     if (!refundMature) throw new Error("el reembolso aún no está disponible (plazo sin vencer)");
+    requireValidAgreement();
     requireSpendableEscrow();
     const dest = effectiveMyArk || recoveredSellerArk;
     if (!dest) throw new Error("falta tu dirección Ark de cobro");
@@ -922,6 +1035,7 @@ export function TradePanel({
     if (role !== "seller") throw new Error("solo el vendedor (quien fondea el escrow) puede recuperarlo");
     if (!refundMature)
       throw new Error("la recuperación aún no está disponible (plazo de reembolso sin vencer)");
+    requireValidAgreement();
     run(async () => {
       const dest = derivePersonalArkAddress(identity, ctx);
       const arkTxid = await recoverEscrowVtxos(ctx, identity, escrow, (event) => {
@@ -934,6 +1048,7 @@ export function TradePanel({
   /** Buyer or seller escalates to every solver in the escrow's solver set. */
   function handleOpenDispute() {
     if (!identity) throw new Error("sin identidad");
+    requireValidAgreement();
     if (!agreement) throw new Error("aún no hay acuerdo de escrow");
     const buyerAddress =
       (role === "buyer" ? effectiveMyArk : buyerArk.trim()) || recoveredBuyerArk;
@@ -979,6 +1094,7 @@ export function TradePanel({
    */
   function handleTakeDispute() {
     if (!identity) throw new Error("sin identidad");
+    requireValidAgreement();
     if (!agreement) throw new Error("aún no hay acuerdo de escrow");
     if (takenByOther) throw new Error("otro solver ya tomó esta disputa");
     run(async () => {
@@ -1007,6 +1123,7 @@ export function TradePanel({
    */
   function handleRequestAddresses() {
     if (!identity) throw new Error("sin identidad");
+    requireValidAgreement();
     if (!agreement) throw new Error("aún no hay acuerdo de escrow");
     if (!holdsTake) throw new Error("toma la disputa antes de pedir las direcciones");
     run(async () => {
@@ -1024,6 +1141,7 @@ export function TradePanel({
 
   function handleSendArkAddressToSolver() {
     if (!identity) throw new Error("sin identidad");
+    requireValidAgreement();
     if (!agreement) throw new Error("sin acuerdo");
     const solver =
       disputeTakenMsg?.payload?.solverPubKey ||
@@ -1048,7 +1166,7 @@ export function TradePanel({
    * arrived, in which case the arbiter must not pay that party.
    */
   function authenticatedAddress(partyRole: TradeRole): string | null {
-    const agr = disputeMsg?.payload.agreement ?? agreement;
+    const agr = disputeMsg?.payload?.agreement ?? agreement;
     if (!agr) return null;
     const pub = (partyRole === "buyer" ? agr.buyerPubKey : agr.sellerPubKey).toLowerCase();
     const claim =
@@ -1068,7 +1186,7 @@ export function TradePanel({
     // A claim may arrive without an agreement (the buyer states its address
     // to the seller before the escrow exists). The DM author is what
     // authenticates it, so the agreement is only checked when it is there.
-    const a = claim.msg.payload.agreement;
+    const a = claim.msg.payload?.agreement;
     if (a && (a.buyerPubKey !== agr.buyerPubKey || a.sellerPubKey !== agr.sellerPubKey)) {
       return null;
     }
@@ -1105,6 +1223,8 @@ export function TradePanel({
     if (!isSolver) throw new Error("no eres solver de esta disputa");
     if (!holdsTake) throw new Error("esta disputa la tomó otro solver");
     if (!disputeMsg) throw new Error("no hay una disputa para resolver");
+    requireValidAgreement();
+    if (!agreement) throw new Error("aún no hay acuerdo de escrow");
     const p = disputeMsg.payload;
     const winner: TradeRole = outcome === "release_to_buyer" ? "buyer" : "seller";
     const destination = authenticatedAddress(winner);
@@ -1161,7 +1281,7 @@ export function TradePanel({
   // must act *before* this deadline when the evidence favours the buyer — it
   // must not wait for the seller to answer.
   const solverDeadline =
-    disputeMsg !== null ? Number(disputeMsg.payload.agreement.refundLocktime ?? 0) : 0;
+    disputeMsg !== null ? Number(disputeMsg.payload?.agreement?.refundLocktime ?? 0) : 0;
   const solverSecondsLeft = solverDeadline > 0 ? solverDeadline - chainSec : 0;
   // Window within which the deadline is close enough to escalate the warning.
   const deadlineNear = solverDeadline > 0 && solverSecondsLeft <= 6 * 3600;
@@ -1173,6 +1293,39 @@ export function TradePanel({
         Acuerdo de escrow, métodos de pago, firma cooperativa y disputa/arbitraje por mensajes
         privados cifrados (NIP-17). Todo en mutinynet, fondos de prueba.
       </p>
+      {agreementValidation && !agreementValidation.ok && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: "10px 12px",
+            border: "1px solid #dc2626",
+            borderRadius: 8,
+            background: "rgba(220, 38, 38, 0.08)",
+          }}
+        >
+          <strong>Acuerdo de escrow inválido: no operes con esta operación.</strong>
+          <ul style={{ margin: "6px 0 0 18px", padding: 0 }}>
+            {agreementValidation.errors.map((message) => (
+              <li key={message}>{message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {agreementValidation?.ok && agreementValidation.warnings.length > 0 && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: "10px 12px",
+            border: "1px solid #d97706",
+            borderRadius: 8,
+            background: "rgba(217, 119, 6, 0.08)",
+          }}
+        >
+          {agreementValidation.warnings.map((message) => (
+            <div key={message}>{message}</div>
+          ))}
+        </div>
+      )}
       {isSolver && (
         <p style={{ color: "#b45309", fontSize: "0.9em" }}>
           Esta clave está en el solver set de este escrow: aquí recibes disputas y las resuelves.
@@ -1313,12 +1466,12 @@ export function TradePanel({
             >
               Acordar y enviar escrow
             </button>
-            <button type="button" disabled={busy || !escrow} onClick={() => checkFunding(true)}>
+            <button type="button" disabled={busy || !escrow || !agreementOk} onClick={() => checkFunding(true)}>
               Comprobar fondeo y avisar
             </button>
             <button
               type="button"
-              disabled={busy || !vtxo || !buyerArk || fundingExact === false || !escrowSpendable}
+              disabled={busy || !vtxo || !buyerArk || fundingExact === false || !escrowSpendable || !agreementOk}
               onClick={handleReleaseRequest}
             >
               Solicitar liberación (firmar y enviar)
@@ -1326,7 +1479,7 @@ export function TradePanel({
             <button
               type="button"
               disabled={
-                busy || !vtxo || !refundMature || releaseDone !== null || !escrowSpendable
+                busy || !vtxo || !refundMature || releaseDone !== null || !escrowSpendable || !agreementOk
               }
               title={
                 refundMature
@@ -1441,10 +1594,10 @@ export function TradePanel({
             </div>
           )}
           <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button type="button" disabled={busy || !canSend} onClick={handleFiatSent}>
-              Avisar pago fiat
+            <button type="button" className="btn btn-buy" disabled={busy || !canSend || !agreementOk} onClick={handleFiatSent}>
+              He pagado
             </button>
-            <button type="button" disabled={busy || !escrow} onClick={() => checkFunding(false)}>
+            <button type="button" disabled={busy || !escrow || !agreementOk} onClick={() => checkFunding(false)}>
               Comprobar fondeo
             </button>
             <button
@@ -1455,7 +1608,8 @@ export function TradePanel({
                 !escrow ||
                 !vtxo ||
                 fundingExact === false ||
-                !escrowSpendable
+                !escrowSpendable ||
+                !agreementOk
               }
               onClick={handleReleaseNow}
             >
@@ -1503,7 +1657,8 @@ export function TradePanel({
                 busy ||
                 !identity ||
                 !agreement ||
-                agreement.arbiterPubKeys.length === 0 ||
+                !agreementOk ||
+                (agreement.arbiterPubKeys?.length ?? 0) === 0 ||
                 !escrowSpendable
               }
               onClick={handleOpenDispute}
@@ -1513,15 +1668,15 @@ export function TradePanel({
           </div>
         </div>
       )}
-      {isSolver && disputeMsg && (
+      {isSolver && disputeMsg && agreementOk && (
         <div style={{ padding: 8, border: "1px solid #8884", borderRadius: 8 }}>
           <div>
-            <strong>Disputa</strong> de {peer(disputeMsg.from)}: {disputeMsg.payload.reason}
+            <strong>Disputa</strong> de {peer(disputeMsg.from)}: {disputeMsg.payload?.reason}
           </div>
           <div style={{ fontSize: "0.85em", opacity: 0.8 }}>
-            {disputeMsg.payload.agreement.tradeSats.toLocaleString()} sats ·{" "}
-            {disputeMsg.payload.agreement.fiatAmount.toLocaleString()}{" "}
-            {disputeMsg.payload.agreement.fiat} · orden {effectiveOrderId.slice(0, 8)}…
+            {disputeMsg.payload?.agreement?.tradeSats?.toLocaleString()} sats ·{" "}
+            {disputeMsg.payload?.agreement?.fiatAmount?.toLocaleString()}{" "}
+            {disputeMsg.payload?.agreement?.fiat} · orden {effectiveOrderId.slice(0, 8)}…
           </div>
           {solverDeadline > 0 && (
             <div
@@ -1574,7 +1729,7 @@ export function TradePanel({
           {canTakeDispute && (
             <button
               type="button"
-              disabled={busy}
+              disabled={busy || !agreementOk}
               onClick={handleTakeDispute}
               style={{ marginBottom: 8 }}
             >
@@ -1584,7 +1739,7 @@ export function TradePanel({
           {holdsTake && !takenByOther && (!authBuyerAddr || !authSellerAddr) && (
             <button
               type="button"
-              disabled={busy || !identity || !agreement}
+              disabled={busy || !identity || !agreement || !agreementOk}
               onClick={handleRequestAddresses}
               style={{ marginBottom: 8, marginLeft: 8 }}
               title="Pide a las partes su dirección Ark autenticada para poder pagarles"
@@ -1600,7 +1755,7 @@ export function TradePanel({
               </span>
             ) : (
               <span style={{ color: "crimson" }}>
-                sin verificar (reclama {disputeMsg.payload.buyerArkAddress.slice(0, 16)}…)
+                sin verificar (reclama {disputeMsg.payload?.buyerArkAddress?.slice(0, 16)}…)
               </span>
             )}
           </div>
@@ -1612,7 +1767,7 @@ export function TradePanel({
               </span>
             ) : (
               <span style={{ color: "crimson" }}>
-                sin verificar (reclama {disputeMsg.payload.sellerArkAddress.slice(0, 16)}…)
+                sin verificar (reclama {disputeMsg.payload?.sellerArkAddress?.slice(0, 16)}…)
               </span>
             )}
           </div>
@@ -1658,7 +1813,7 @@ export function TradePanel({
             <button className="btn btn-buy" onClick={handleSendArkAddressToSolver} disabled={busy || !myArk.trim()}>
               Enviar dirección Ark al solver
             </button>
-            <button className="btn btn-ghost" onClick={() => onOpenChat?.(disputeTakenMsg?.payload?.solverPubKey || (disputeMsg?.payload as any)?.solverPubKey || agreement.arbiterPubKeys?.[0] || "")}>
+            <button className="btn btn-ghost" onClick={() => onOpenChat?.(disputeTakenMsg?.payload?.solverPubKey || (disputeMsg?.payload as any)?.solverPubKey || agreement?.arbiterPubKeys?.[0] || "")}>
               Abrir chat con el solver
             </button>
           </div>
