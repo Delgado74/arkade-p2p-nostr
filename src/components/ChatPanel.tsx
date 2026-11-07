@@ -287,7 +287,18 @@ export function ChatPanel({
   function openDisputeRoom(room: DisputeRoom) {
     const key = `dispute:${room.orderId}`;
     markRead(key, room.messages);
-    setDisputePeer(null);
+    try {
+      const peers = disputePeers(room.orderId, feed, disputeTakes, identity.pubkeyHex);
+      if (peers.length > 0) {
+        setDisputePeer(peers[0]);
+      } else if ((room as any).peers?.length > 0) {
+        setDisputePeer((room as any).peers[0]);
+      } else {
+        setDisputePeer(null);
+      }
+    } catch {
+      setDisputePeer(null);
+    }
     setOpenRoom({ segment: "disputas", key });
     setError("");
   }
@@ -433,11 +444,7 @@ export function ChatPanel({
     );
   }
 
-  function roomMessages(): ChatMessage[] {
-    if (openConv) return openConv.messages;
-    if (openDispute) return openDispute.messages;
-    return [];
-  }
+  // roomMessages handled via messages useMemo
 
   function roomTitle(): { title: string; sub: string; chip: boolean } {
     if (openConv) {
@@ -448,10 +455,11 @@ export function ChatPanel({
       };
     }
     if (openDispute) {
+      const pName = activeDisputePeer ? (peerLabelIn(openDispute.orderId, activeDisputePeer, feed) || activeDisputePeer.slice(0, 12) + "…") : "";
       return {
         title: `Orden ${openDispute.orderId.slice(0, 10)}…`,
-        sub: disputeStatusLine(openDispute, peer),
-        chip: openDispute.open,
+      sub: disputeStatusLine(openDispute, () => pName),
+      chip: openDispute.open,
       };
     }
     return { title: "", sub: "", chip: false };
@@ -483,7 +491,30 @@ export function ChatPanel({
   })();
 
   const title = roomTitle();
-  const messages = roomMessages();
+  const messages = useMemo(() => {
+    if (!openDispute && !openConv) return [];
+    if (openDispute) {
+      const all = openDispute.messages || [];
+      if (!activeDisputePeer) return [];
+      return all.filter((m: any) => {
+        if (m.kind === "system" || m.system) return true;
+        const t = m.rawType || m.type || m.msg?.type;
+        if (t === "ark_address_request" || t === "ark_address" || t === "dispute" || t === "dispute_taken" || t === "arbiter_decision") return false;
+        const p = (m.peerPubkey || m.sender || m.msg?.from || "").toLowerCase();
+        if (!p) return false;
+        return p === activeDisputePeer.toLowerCase();
+      });
+    }
+    if (openConv) {
+      const all = openConv.messages || [];
+      return all.filter((m: any) => {
+        const t = m.rawType || m.type || m.msg?.type;
+        if (t === "ark_address_request" || t === "ark_address") return false;
+        return true;
+      });
+    }
+    return [];
+  }, [openDispute, openConv, activeDisputePeer]);
 
   return (
     <section className="chat">
@@ -491,7 +522,7 @@ export function ChatPanel({
         <button
           type="button"
           className="chat-segment"
-          data-active={segment === "mensajes" && room === null}
+          data-active={segment === "mensajes" && !openRoom}
           onClick={() => {
             setSegment("mensajes");
             goBack();
@@ -503,7 +534,7 @@ export function ChatPanel({
         <button
           type="button"
           className="chat-segment"
-          data-active={segment === "disputas" && room === null}
+          data-active={segment === "disputas" && !openRoom}
           onClick={() => {
             setSegment("disputas");
             goBack();
@@ -514,7 +545,7 @@ export function ChatPanel({
         </button>
       </div>
 
-      {room ? (
+      {openRoom ? (
         <div className="chat-room">
           <div className="chat-room-header">
             <button type="button" className="chat-back" onClick={goBack} aria-label="Volver">
@@ -572,11 +603,40 @@ export function ChatPanel({
 
           <div className="chat-input">
             <input
-              placeholder="Escribe un mensaje…"
+              placeholder={openDispute ? "Solo texto. No se permiten capturas ni archivos." : "Escribe un mensaje…"}
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              maxLength={2000}
+              onChange={(e) => {
+                if (openDispute) {
+                  setDraft(e.target.value.replace(/\n/g, " "));
+                } else {
+                  setDraft(e.target.value);
+                }
+              }}
+              onPaste={(e) => {
+                if (!openDispute) return;
+                const items = Array.from(e.clipboardData?.items || []);
+                if (items.some((it) => it.type.startsWith("image/"))) {
+                  e.preventDefault();
+                  setError("Solo se permite texto en el chat de disputa.");
+                  return;
+                }
+              }}
+              onDrop={(e) => {
+                if (!openDispute) return;
+                if (e.dataTransfer?.files?.length) {
+                  e.preventDefault();
+                  setError("Solo se permite texto en el chat de disputa.");
+                }
+              }}
+              onDragOver={(e) => {
+                if (openDispute) e.preventDefault();
+              }}
               onKeyDown={(e) => {
-                if (e.key === "Enter") void handleSend();
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void handleSend();
+                }
               }}
             />
             <button type="button" disabled={busy || !draft.trim()} onClick={() => void handleSend()}>
