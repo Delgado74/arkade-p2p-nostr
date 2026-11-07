@@ -97,6 +97,56 @@ function isHex64(value: string | undefined): value is string {
   return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
 }
 
+const ORDER_STATUSES: readonly OrderStatus[] = [
+  "pending",
+  "canceled",
+  "in-progress",
+  "success",
+  "expired",
+];
+
+const DISPUTE_STATUSES: readonly DisputeStatus[] = [
+  "initiated",
+  "in-progress",
+  "settled",
+  "refunded",
+  "canceled",
+];
+
+const FIAT_RE = /^[A-Z0-9]{2,16}$/;
+const MAX_ID_LENGTH = 256;
+const MAX_TEXT_LENGTH = 2000;
+const MAX_METHODS = 20;
+const MAX_METHOD_LENGTH = 64;
+
+function isShortId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= MAX_ID_LENGTH
+  );
+}
+
+function isFiat(value: unknown): value is string {
+  return typeof value === "string" && FIAT_RE.test(value.trim().toUpperCase());
+}
+
+function isStatus<T extends string>(value: unknown, allowed: readonly T[]): value is T {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return isFiniteNumber(value) && Number.isSafeInteger(value) && value > 0;
+}
+
+function isOptionalText(value: unknown, max = MAX_TEXT_LENGTH): value is string | undefined {
+  return value === undefined || (typeof value === "string" && value.length <= max);
+}
+
 /** Generate a fresh addressable order id. */
 export function newOrderId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -149,20 +199,36 @@ export function parseOrder(event: Event): Order | null {
   const premium = num(tag(event, "premium"));
   const network = tag(event, "network");
   const layer = tag(event, "layer");
+  const expiresAt = num(tag(event, "expires_at"));
+  const expiration = num(tag(event, "expiration"));
+  const bond = num(tag(event, "bond"));
 
   if (
-    !id ||
+    !isShortId(id) ||
     (type !== "buy" && type !== "sell") ||
-    !fiat ||
-    !status ||
-    amountSats === undefined ||
-    fiatAmount === undefined ||
-    premium === undefined ||
-    !network ||
-    !layer
+    !isFiat(fiat) ||
+    !isStatus(status, ORDER_STATUSES) ||
+    !isFiniteNumber(amountSats) ||
+    !Number.isSafeInteger(amountSats) ||
+    amountSats < 0 ||
+    !isFiniteNumber(fiatAmount) ||
+    fiatAmount <= 0 ||
+    !isFiniteNumber(premium) ||
+    typeof network !== "string" ||
+    network.length === 0 ||
+    network.length > 32 ||
+    typeof layer !== "string" ||
+    layer.length === 0 ||
+    layer.length > 32 ||
+    (expiresAt !== undefined && (!isFiniteNumber(expiresAt) || expiresAt < 0)) ||
+    (expiration !== undefined && (!isFiniteNumber(expiration) || expiration < 0)) ||
+    (bond !== undefined && (!isFiniteNumber(bond) || bond < 0)) ||
+    !isOptionalText(event.content, MAX_TEXT_LENGTH) ||
+    !isHex64(event.pubkey)
   ) {
     return null;
   }
+  if (!isFiniteNumber(event.created_at) || event.created_at <= 0) return null;
 
   const paymentMethods = event.tags
     .filter((t) => t[0] === "pm")
@@ -170,6 +236,17 @@ export function parseOrder(event: Event): Order | null {
     .flatMap((value) => value.split(","))
     .map((value) => value.trim())
     .filter(Boolean);
+  if (
+    paymentMethods.length > MAX_METHODS ||
+    paymentMethods.some((method) => method.length > MAX_METHOD_LENGTH)
+  ) {
+    return null;
+  }
+
+  const arkAddress = tag(event, "ark");
+  if (arkAddress !== undefined && (arkAddress.length === 0 || arkAddress.length > 256)) {
+    return null;
+  }
 
   return {
     id,
@@ -184,14 +261,14 @@ export function parseOrder(event: Event): Order | null {
     network,
     layer,
     createdAt: event.created_at,
-    expiresAt: num(tag(event, "expires_at")),
-    expiration: num(tag(event, "expiration")),
+    expiresAt,
+    expiration,
     name: tag(event, "name"),
     source: tag(event, "source"),
-    bond: num(tag(event, "bond")),
+    bond,
     geohash: tag(event, "g"),
     platform: tag(event, "y") ?? "unknown",
-    arkAddress: tag(event, "ark"),
+    arkAddress,
     event,
   };
 }
@@ -229,11 +306,17 @@ export interface SolverRegistry {
 export function parseSolverRegistry(event: Event): SolverRegistry | null {
   if (event.kind !== SOLVERS_KIND) return null;
   const d = tag(event, "d");
-  if (d !== "solvers") return null;
-  const solvers = event.tags
-    .filter((t) => t[0] === "s")
-    .map((t) => t[1])
-    .filter((v) => typeof v === "string" && v.length > 0);
+  if (d !== "solvers" || !isHex64(event.pubkey)) return null;
+  const solvers = [
+    ...new Set(
+      event.tags
+        .filter((t) => t[0] === "s")
+        .map((t) => t[1])
+        .filter((v): v is string => isHex64(v))
+        .map((v) => v.toLowerCase()),
+    ),
+  ];
+  if (solvers.length > 50) return null;
   return {
     id: d,
     pubkey: event.pubkey,
@@ -260,15 +343,28 @@ export function parseDisputeAnnounce(event: Event): DisputeAnnounce | null {
   if (event.kind !== DISPUTE_KIND) return null;
   if (!isOurPlatform(event) || !hasZ(event, "dispute")) return null;
   const d = tag(event, "d");
+  const e = event.tags.find((t) => t[0] === "e")?.[1];
   const status = tag(event, "s");
   const initiator = tag(event, "initiator");
-  if (!d || !status || !isHex64(initiator)) return null;
+  if (
+    !isShortId(d) ||
+    e !== d ||
+    !isStatus(status, DISPUTE_STATUSES) ||
+    !isHex64(initiator) ||
+    initiator.toLowerCase() !== event.pubkey.toLowerCase() ||
+    !isHex64(event.pubkey) ||
+    !isFiniteNumber(event.created_at) ||
+    !isOptionalText(event.tags.find((t) => t[0] === "reason")?.[1], 500)
+  ) {
+    return null;
+  }
   return {
     id: d,
     pubkey: event.pubkey,
     orderId: d,
-    status: status as DisputeStatus,
+    status,
     initiator,
+    reason: tag(event, "reason"),
     createdAt: event.created_at,
     event,
   };
@@ -278,7 +374,9 @@ export interface DisputeTake {
   id: string;
   pubkey: string;
   orderId: string;
-  solverPubKey: string; // hex
+  /** Event id of the `DisputeAnnounce` this take claims to resolve. */
+  announceEventId: string;
+  solverPubKey: string; // hex, always equal to the event author
   createdAt: number;
   event: Event;
 }
@@ -289,13 +387,22 @@ export function parseDisputeTake(event: Event): DisputeTake | null {
   const d = tag(event, "d");
   const solver = tag(event, "solver");
   const e = event.tags.find((t) => t[0] === "e")?.[1];
-  const orderId = d || e;
-  if (!orderId || !isHex64(solver)) return null;
+  if (
+    !isShortId(d) ||
+    !isHex64(e) ||
+    !isHex64(solver) ||
+    solver.toLowerCase() !== event.pubkey.toLowerCase() ||
+    !isHex64(event.pubkey) ||
+    !isFiniteNumber(event.created_at)
+  ) {
+    return null;
+  }
   return {
-    id: orderId,
+    id: d,
     pubkey: event.pubkey,
-    orderId,
-    solverPubKey: solver,
+    orderId: d,
+    announceEventId: e,
+    solverPubKey: solver.toLowerCase(),
     createdAt: event.created_at,
     event,
   };
@@ -305,6 +412,8 @@ export interface DisputeResolution {
   id: string;
   pubkey: string;
   orderId: string;
+  /** Event id of the `DisputeAnnounce` this resolution closes. */
+  announceEventId: string;
   status: DisputeStatus;
   solverPubKey: string;
   arkTxid?: string;
@@ -320,14 +429,25 @@ export function parseDisputeResolution(event: Event): DisputeResolution | null {
   const status = tag(event, "s");
   const solver = tag(event, "solver");
   const ark = tag(event, "ark_txid");
-  const orderId = d || e;
-  if (!orderId || !status || !isHex64(solver)) return null;
+  if (
+    !isShortId(d) ||
+    !isHex64(e) ||
+    !isStatus(status, ["settled", "refunded"] as const) ||
+    !isHex64(solver) ||
+    solver.toLowerCase() !== event.pubkey.toLowerCase() ||
+    !isHex64(event.pubkey) ||
+    !isFiniteNumber(event.created_at) ||
+    (ark !== undefined && (typeof ark !== "string" || ark.length === 0 || ark.length > 256))
+  ) {
+    return null;
+  }
   return {
-    id: orderId,
+    id: d,
     pubkey: event.pubkey,
-    orderId,
-    status: status as DisputeStatus,
-    solverPubKey: solver,
+    orderId: d,
+    announceEventId: e,
+    status,
+    solverPubKey: solver.toLowerCase(),
     arkTxid: ark,
     createdAt: event.created_at,
     event,
@@ -356,14 +476,26 @@ export function buildDisputeAnnounceTemplate(
   };
 }
 
-/** Build a solver's optimistic take of a dispute. Earliest created_at wins. */
-export function buildDisputeTakeTemplate(orderId: string, solverPubKey: string): EventTemplate {
+/**
+ * Build a solver's optimistic take of a dispute. Earliest created_at wins.
+ *
+ * `e` points at the public announcement event, not at the order id: a take is
+ * only valid for the exact dispute it claims to resolve.
+ */
+export function buildDisputeTakeTemplate(
+  orderId: string,
+  solverPubKey: string,
+  announceEventId: string,
+): EventTemplate {
+  if (!isHex64(announceEventId)) {
+    throw new Error("el take necesita el id del anuncio de disputa");
+  }
   return {
     kind: DISPUTE_TAKE_KIND,
     created_at: Math.floor(Date.now() / 1000),
     tags: [
       ["d", orderId],
-      ["e", orderId],
+      ["e", announceEventId],
       ["z", "dispute-take"],
       ["y", PLATFORM],
       ["s", "in-progress"],
@@ -378,11 +510,15 @@ export function buildDisputeResolutionTemplate(
   orderId: string,
   solverPubKey: string,
   status: "settled" | "refunded",
+  announceEventId: string,
   arkTxid?: string,
 ): EventTemplate {
+  if (!isHex64(announceEventId)) {
+    throw new Error("la resolución necesita el id del anuncio de disputa");
+  }
   const tags: string[][] = [
     ["d", orderId],
-    ["e", orderId],
+    ["e", announceEventId],
     ["z", "dispute-resolution"],
     ["y", PLATFORM],
     ["s", status],
@@ -390,6 +526,98 @@ export function buildDisputeResolutionTemplate(
   ];
   if (arkTxid) tags.push(["ark_txid", arkTxid]);
   return { kind: DISPUTE_RESOLUTION_KIND, created_at: Math.floor(Date.now() / 1000), tags, content: "" };
+}
+
+/** Newest public announcement for an order, if any. */
+export function latestDisputeAnnounce(
+  announces: readonly DisputeAnnounce[],
+  orderId: string,
+): DisputeAnnounce | null {
+  let latest: DisputeAnnounce | null = null;
+  for (const announce of announces) {
+    if (announce.orderId !== orderId) continue;
+    if (!latest || announce.createdAt > latest.createdAt) latest = announce;
+  }
+  return latest;
+}
+
+/**
+ * A take is authentic only when it points at an existing announcement for the
+ * same order and its solver is in the trusted set (escrow solver set or the
+ * coordinator registry). Without that binding any key could publish a take and
+ * win the optimistic race for someone else's dispute.
+ */
+export function isDisputeTakeValid(
+  take: DisputeTake,
+  announce: DisputeAnnounce | null | undefined,
+  allowedSolvers?: readonly string[] | null,
+): boolean {
+  if (!announce) return false;
+  if (announce.event.id !== take.announceEventId) return false;
+  if (announce.orderId !== take.orderId) return false;
+  if (take.solverPubKey !== take.pubkey.toLowerCase()) return false;
+  if (allowedSolvers && allowedSolvers.length > 0) {
+    const me = take.solverPubKey.toLowerCase();
+    if (!allowedSolvers.some((solver) => solver.toLowerCase() === me)) return false;
+  }
+  return true;
+}
+
+/** Filter takes to the ones bound to an announcement and trusted solver set. */
+export function validDisputeTakes(
+  takes: readonly DisputeTake[],
+  announces: readonly DisputeAnnounce[],
+  allowedSolvers?: readonly string[] | null,
+): DisputeTake[] {
+  const byEvent = new Map(announces.map((announce) => [announce.event.id, announce]));
+  const latestByOrder = new Map<string, DisputeAnnounce>();
+  for (const announce of announces) {
+    const current = latestByOrder.get(announce.orderId);
+    if (!current || announce.createdAt > current.createdAt) {
+      latestByOrder.set(announce.orderId, announce);
+    }
+  }
+  return takes.filter((take) => {
+    const announce = byEvent.get(take.announceEventId);
+    if (!announce) return false;
+    if (latestByOrder.get(announce.orderId)?.event.id !== announce.event.id) {
+      return false;
+    }
+    return isDisputeTakeValid(take, announce, allowedSolvers);
+  });
+}
+
+/**
+ * A resolution only counts when it closes the same announcement as the winning
+ * take and is signed by that winning solver. This prevents a non-solver (or a
+ * losing solver) from publishing a fake "resolved" event to hide the room.
+ */
+export function validDisputeResolutions(
+  resolutions: readonly DisputeResolution[],
+  announces: readonly DisputeAnnounce[],
+  takes: readonly DisputeTake[],
+  allowedSolvers?: readonly string[] | null,
+): DisputeResolution[] {
+  const byEvent = new Map(announces.map((announce) => [announce.event.id, announce]));
+  const winners = new Map<string, DisputeTake>();
+  for (const take of validDisputeTakes(takes, announces, allowedSolvers)) {
+    const current = winners.get(take.orderId);
+    if (!current || take.createdAt < current.createdAt || (take.createdAt === current.createdAt && take.event.id < current.event.id)) {
+      winners.set(take.orderId, take);
+    }
+  }
+  return resolutions.filter((resolution) => {
+    const announce = byEvent.get(resolution.announceEventId);
+    if (!announce || announce.orderId !== resolution.orderId) return false;
+    const winner = winners.get(resolution.orderId);
+    if (!winner || winner.solverPubKey !== resolution.solverPubKey) return false;
+    if (resolution.createdAt < winner.createdAt) return false;
+    if (allowedSolvers && allowedSolvers.length > 0) {
+      const me = resolution.solverPubKey.toLowerCase();
+      if (!allowedSolvers.some((solver) => solver.toLowerCase() === me)) return false;
+    }
+    return true;
+  });
 }
 
 /**
@@ -442,7 +670,7 @@ export interface Rating {
 
 /** True when `value` is an integer within the allowed star range. */
 export function isValidRatingValue(value: number): boolean {
-  return Number.isInteger(value) && value >= RATING_MIN && value <= RATING_MAX;
+  return isPositiveInteger(value) && value >= RATING_MIN && value <= RATING_MAX;
 }
 
 /**
@@ -464,13 +692,17 @@ export function buildRatingTemplate(params: {
   if (!isValidRatingValue(params.value)) {
     throw new Error(`rating fuera de rango: ${params.value}`);
   }
+  if (!isShortId(params.orderId) || !isHex64(params.orderEventId) || !isHex64(params.ratee)) {
+    throw new Error("rating con orden o contraparte inválida");
+  }
+  const ratee = params.ratee.toLowerCase();
   return {
     kind: RATING_KIND,
     created_at: Math.floor(Date.now() / 1000),
     tags: [
-      ["d", ratingKey(params.orderId, params.ratee)],
+      ["d", ratingKey(params.orderId, ratee)],
       ["e", params.orderEventId],
-      ["p", params.ratee],
+      ["p", ratee],
       ["rating", String(params.value)],
       ["role", params.role],
       ["y", PLATFORM],
@@ -483,17 +715,33 @@ export function buildRatingTemplate(params: {
 /** Parse a reputation event, returning null when it is malformed. */
 export function parseRating(event: Event): Rating | null {
   if (event.kind !== RATING_KIND) return null;
-  const ratee = tag(event, "p");
-  // `d` is `<orderId>:<ratee>` (see `ratingKey`); keep only the order id.
-  const orderId = tag(event, "d")?.split(":")[0];
+  if (!isOurPlatform(event) || !hasZ(event, "rating")) return null;
+  const rateeTag = tag(event, "p");
+  const d = tag(event, "d");
+  const e = event.tags.find((t) => t[0] === "e")?.[1];
   const ratingRaw = tag(event, "rating");
   const roleRaw = tag(event, "role");
-  if (!ratee || !orderId || !ratingRaw) return null;
-  if (roleRaw !== "buyer" && roleRaw !== "seller") return null;
+  if (
+    !isHex64(event.pubkey) ||
+    !isHex64(rateeTag) ||
+    !isHex64(e) ||
+    !d ||
+    !ratingRaw ||
+    (roleRaw !== "buyer" && roleRaw !== "seller") ||
+    !isFiniteNumber(event.created_at) ||
+    event.created_at <= 0
+  ) {
+    return null;
+  }
+  const ratee = rateeTag.toLowerCase();
+  const suffix = `:${ratee}`;
+  if (!d.endsWith(suffix)) return null;
+  const orderId = d.slice(0, -suffix.length);
+  if (!isShortId(orderId)) return null;
   const value = Number(ratingRaw);
   if (!isValidRatingValue(value)) return null;
   return {
-    ratee: ratee.toLowerCase(),
+    ratee,
     rater: event.pubkey.toLowerCase(),
     value,
     role: roleRaw,

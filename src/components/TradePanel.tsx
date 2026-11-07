@@ -48,7 +48,9 @@ import {
   buildDisputeTakeTemplate,
   buildDisputeResolutionTemplate,
   buildOrderTemplate,
+  latestDisputeAnnounce,
   pickDisputeTakeTaker,
+  validDisputeTakes,
   type DisputeAnnounce,
   type DisputeTake,
   type SolverRegistry,
@@ -454,9 +456,24 @@ export function TradePanel({
       agreement.arbiterPubKeys?.some((p) => p.toLowerCase() === identity.pubkeyHex.toLowerCase()),
   );
 
-  // Optimistic take: earliest created_at wins, ties broken by lowest event id,
-  // so every client derives the same winner without a server.
-  const takesForOrder = disputeTakes.filter((t) => t.orderId === effectiveOrderId);
+  // A take must point at the public announcement and come from a solver in the
+  // escrow's committed set (or the coordinator registry while no agreement is
+  // visible). Filtering here is what prevents an arbitrary key from winning the
+  // optimistic race for somebody else's dispute.
+  const orderAnnounces = agreement
+    ? disputeAnnounces.filter(
+        (announce) =>
+          announce.initiator.toLowerCase() === agreement.buyerPubKey.toLowerCase() ||
+          announce.initiator.toLowerCase() === agreement.sellerPubKey.toLowerCase(),
+      )
+    : disputeAnnounces;
+  const announceForOrder = latestDisputeAnnounce(orderAnnounces, effectiveOrderId);
+  const allowedSolvers = agreement?.arbiterPubKeys ?? trustedSolvers;
+  const takesForOrder = validDisputeTakes(
+    disputeTakes,
+    orderAnnounces,
+    allowedSolvers,
+  ).filter((t) => t.orderId === effectiveOrderId);
   const takeTaker = pickDisputeTakeTaker(takesForOrder);
   const isTaker = Boolean(
     takeTaker &&
@@ -481,9 +498,12 @@ export function TradePanel({
         (!takeTaker ||
           (identity && takeTaker.solverPubKey.toLowerCase() === identity.pubkeyHex.toLowerCase())),
     );
-  const canTakeDispute = isSolver && Boolean(disputeMsg) && !holdsTake && !takenByOther;
-  const announceForOrder =
-    disputeAnnounces.find((d) => d.orderId === effectiveOrderId) ?? null;
+  const canTakeDispute =
+    isSolver &&
+    Boolean(disputeMsg) &&
+    Boolean(announceForOrder) &&
+    !holdsTake &&
+    !takenByOther;
 
   // Escrow funding is a public on-chain fact: once either side has seen the
   // VTXO (detected locally or announced) there is nothing left to poll for.
@@ -1097,11 +1117,16 @@ export function TradePanel({
     requireValidAgreement();
     if (!agreement) throw new Error("aún no hay acuerdo de escrow");
     if (takenByOther) throw new Error("otro solver ya tomó esta disputa");
+    if (!announceForOrder) throw new Error("no se encontró el anuncio público de la disputa");
     run(async () => {
       setLocalTake({ orderId: effectiveOrderId, solverPubKey: identity.pubkeyHex });
       try {
         await client.publish(
-          buildDisputeTakeTemplate(effectiveOrderId, identity.pubkeyHex),
+          buildDisputeTakeTemplate(
+            effectiveOrderId,
+            identity.pubkeyHex,
+            announceForOrder.event.id,
+          ),
           identity,
         );
         // Tell both parties who is resolving, so they can chat with us directly.
@@ -1251,13 +1276,16 @@ export function TradePanel({
       };
       await sendTo(p.agreement.buyerPubKey, "arbiter_decision", payload);
       await sendTo(p.agreement.sellerPubKey, "arbiter_decision", payload);
-      // Public resolution so every client agrees the dispute is over.
+      // Public resolution so every client agrees the dispute is over. It is
+      // bound to the same announcement as the winning take.
+      if (!announceForOrder) throw new Error("no se encontró el anuncio público de la disputa");
       await client
         .publish(
           buildDisputeResolutionTemplate(
             p.agreement.orderId,
             identity.pubkeyHex,
             outcome === "release_to_buyer" ? "settled" : "refunded",
+            announceForOrder.event.id,
             arkTxid,
           ),
           identity,

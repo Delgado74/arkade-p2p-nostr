@@ -3,6 +3,8 @@ import type { TradeDm } from "./trade";
 import type { OperationRecord } from "./operations";
 import {
   pickDisputeTakeTaker,
+  validDisputeResolutions,
+  validDisputeTakes,
   type DisputeAnnounce,
   type DisputeResolution,
   type DisputeStatus,
@@ -268,34 +270,79 @@ export function buildDisputeRooms(
   resolutions: DisputeResolution[],
   myPubKey: string,
   marks: ReadMarks,
+  registrySolvers?: readonly string[] | null,
 ): DisputeRoom[] {
+  const announcesForOrder = (orderId: string): DisputeAnnounce[] => {
+    const agreement = agreementFor(orderId, feed);
+    return announces.filter((announce) => {
+      if (announce.orderId !== orderId) return false;
+      if (!agreement) return true;
+      const initiator = announce.initiator.toLowerCase();
+      return (
+        initiator === agreement.buyerPubKey.toLowerCase() ||
+        initiator === agreement.sellerPubKey.toLowerCase()
+      );
+    });
+  };
+
   const announceByOrder = new Map<string, DisputeAnnounce>();
-  for (const a of announces) {
-    const prev = announceByOrder.get(a.orderId);
-    if (!prev || a.createdAt > prev.createdAt) announceByOrder.set(a.orderId, a);
+  for (const orderId of new Set(announces.map((announce) => announce.orderId))) {
+    for (const announce of announcesForOrder(orderId)) {
+      const prev = announceByOrder.get(orderId);
+      if (!prev || announce.createdAt > prev.createdAt) {
+        announceByOrder.set(orderId, announce);
+      }
+    }
   }
+
+  const trustedTakes = (orderId: string): DisputeTake[] => {
+    const agreement = agreementFor(orderId, feed);
+    const allowed = agreement?.arbiterPubKeys ?? registrySolvers;
+    return validDisputeTakes(takes, announcesForOrder(orderId), allowed).filter(
+      (t) => t.orderId === orderId,
+    );
+  };
+  const trustedResolutions = (orderId: string): DisputeResolution[] => {
+    const agreement = agreementFor(orderId, feed);
+    const allowed = agreement?.arbiterPubKeys ?? registrySolvers;
+    const orderAnnounces = announcesForOrder(orderId);
+    return validDisputeResolutions(
+      resolutions,
+      orderAnnounces,
+      validDisputeTakes(takes, orderAnnounces, allowed),
+      allowed,
+    ).filter((r) => r.orderId === orderId);
+  };
 
   const orderIds = new Set<string>(announceByOrder.keys());
   for (const e of feed) {
     if (e.msg && DISPUTE_TYPES.has(e.msg.type)) orderIds.add(e.msg.orderId);
   }
-  for (const t of takes) orderIds.add(t.orderId);
-  for (const r of resolutions) orderIds.add(r.orderId);
+  for (const orderId of announceByOrder.keys()) {
+    for (const take of trustedTakes(orderId)) orderIds.add(take.orderId);
+    for (const resolution of trustedResolutions(orderId)) orderIds.add(resolution.orderId);
+  }
 
   const rooms: DisputeRoom[] = [];
   for (const orderId of orderIds) {
     const announce = announceByOrder.get(orderId);
-    const takesForOrder = takes.filter((t) => t.orderId === orderId);
+    const takesForOrder = trustedTakes(orderId);
+    const validResolutions = trustedResolutions(orderId);
     const winner = pickDisputeTakeTaker(takesForOrder);
     const resolution =
-      [...resolutions.filter((r) => r.orderId === orderId)].sort(
-        (a, b) => b.createdAt - a.createdAt,
-      )[0] ?? null;
+      [...validResolutions].sort((a, b) => b.createdAt - a.createdAt)[0] ?? null;
     const initiator = announce?.initiator ?? "";
 
     if (
       announce &&
-      !isRelevantDispute(orderId, initiator, feed, takes, resolutions, myPubKey)
+      !isRelevantDispute(
+        orderId,
+        initiator,
+        feed,
+        takesForOrder,
+        validResolutions,
+        myPubKey,
+      )
     ) {
       continue;
     }

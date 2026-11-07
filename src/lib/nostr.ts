@@ -140,9 +140,7 @@ export class NostrClient {
    * form for addressable events).
    */
   private async fetchDeleted(latest: Event[]): Promise<{ e: Set<string>; a: Set<string> }> {
-    const e = new Set<string>();
-    const a = new Set<string>();
-    if (latest.length === 0) return { e, a };
+    if (latest.length === 0) return { e: new Set(), a: new Set() };
 
     const eIds = latest.map((event) => event.id);
     const addrRefs = latest.map((event) => `${event.kind}:${event.pubkey}:${dTag(event)}`);
@@ -150,14 +148,7 @@ export class NostrClient {
       this.pool.querySync(this.relays, { kinds: [DELETION_KIND], "#e": eIds, limit: 500 }),
       this.pool.querySync(this.relays, { kinds: [DELETION_KIND], "#a": addrRefs, limit: 500 }),
     ]);
-
-    for (const event of [...byE, ...byA]) {
-      for (const tag of event.tags) {
-        if (tag[0] === "e" && tag[1]) e.add(tag[1]);
-        if (tag[0] === "a" && tag[1]) a.add(tag[1]);
-      }
-    }
-    return { e, a };
+    return deletionRefsFor(latest, [...byE, ...byA]);
   }
 
   /**
@@ -197,7 +188,15 @@ export class NostrClient {
     if (author) nostrFilter.authors = [author];
     const events = await this.pool.querySync(this.relays, nostrFilter);
     const current = dedupeAddressable(events)[0];
-    return current ? parseOrder(current) : null;
+    if (!current) return null;
+    const deleted = await this.fetchDeleted([current]);
+    if (
+      deleted.e.has(current.id) ||
+      deleted.a.has(`${current.kind}:${current.pubkey}:${dTag(current)}`)
+    ) {
+      return null;
+    }
+    return parseOrder(current);
   }
 
   /**
@@ -412,8 +411,63 @@ export class NostrClient {
       kinds: [ORDER_KIND],
       limit: 1,
     });
-    return events[0] ?? null;
+    const event = events[0];
+    if (!event) return null;
+    const deleted = await this.fetchDeleted([event]);
+    if (
+      deleted.e.has(event.id) ||
+      deleted.a.has(`${event.kind}:${event.pubkey}:${dTag(event)}`)
+    ) {
+      return null;
+    }
+    return event;
   }
+}
+
+/**
+ * NIP-09 deletion targets, but only for deletions signed by the same key that
+ * authored the referenced order and created no earlier than that order. A
+ * relay may accept anyone's kind-5 event; without this check any user could
+ * erase another user's order from every client.
+ */
+export function deletionRefsFor(
+  orders: readonly Event[],
+  deletions: readonly Event[],
+): { e: Set<string>; a: Set<string> } {
+  const e = new Set<string>();
+  const a = new Set<string>();
+  const byId = new Map(orders.map((event) => [event.id, event]));
+  const byAddress = new Map(
+    orders.map((event) => [`${event.kind}:${event.pubkey}:${dTag(event)}`, event]),
+  );
+
+  for (const deletion of deletions) {
+    if (deletion.kind !== DELETION_KIND) continue;
+    const author = deletion.pubkey.toLowerCase();
+    for (const tag of deletion.tags) {
+      if (tag[0] === "e" && tag[1]) {
+        const target = byId.get(tag[1]);
+        if (
+          target &&
+          target.pubkey.toLowerCase() === author &&
+          deletion.created_at >= target.created_at
+        ) {
+          e.add(tag[1]);
+        }
+      }
+      if (tag[0] === "a" && tag[1]) {
+        const target = byAddress.get(tag[1]);
+        if (
+          target &&
+          target.pubkey.toLowerCase() === author &&
+          deletion.created_at >= target.created_at
+        ) {
+          a.add(tag[1]);
+        }
+      }
+    }
+  }
+  return { e, a };
 }
 
 /** Read the addressable `d` tag value (empty string when absent). */

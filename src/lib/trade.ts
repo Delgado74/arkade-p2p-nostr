@@ -172,7 +172,120 @@ export function encodeTradeMessage<K extends TradeMessageType>(msg: TradeMessage
   return JSON.stringify(msg);
 }
 
-/** Parse a DM content string, returning `null` when it is not a trade message. */
+const HEX64 = /^[0-9a-f]{64}$/i;
+const MAX_ID_LENGTH = 256;
+const MAX_TEXT_LENGTH = 10000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isText(value: unknown, max = MAX_TEXT_LENGTH): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= max;
+}
+
+function isOptionalText(value: unknown, max = MAX_TEXT_LENGTH): value is string | undefined {
+  return value === undefined || (typeof value === "string" && value.length <= max);
+}
+
+function isHex64(value: unknown): value is string {
+  return typeof value === "string" && HEX64.test(value);
+}
+
+function isPositiveNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function isSpend(value: unknown): value is SerializedSpend {
+  return (
+    isRecord(value) &&
+    isText(value.arkTx) &&
+    Array.isArray(value.checkpoints) &&
+    value.checkpoints.length > 0 &&
+    value.checkpoints.every((checkpoint) => isText(checkpoint))
+  );
+}
+
+function isAgreementShape(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    isText(value.orderId, MAX_ID_LENGTH) &&
+    isText(value.fiat, 16) &&
+    isPositiveNumber(value.fiatAmount) &&
+    isPositiveNumber(value.tradeSats) &&
+    isHex64(value.buyerPubKey) &&
+    isHex64(value.sellerPubKey) &&
+    Array.isArray(value.arbiterPubKeys) &&
+    value.arbiterPubKeys.length > 0 &&
+    value.arbiterPubKeys.every(isHex64) &&
+    isHex64(value.serverPubKey) &&
+    (value.refundLocktime === undefined || typeof value.refundLocktime === "string")
+  );
+}
+
+function isValidPayload(type: TradeMessageType, payload: unknown): boolean {
+  if (!isRecord(payload)) return false;
+  switch (type) {
+    case "take":
+      return payload.buyerArkAddress === undefined || isText(payload.buyerArkAddress, 256);
+    case "taker_address":
+      return isText(payload.arkAddress, 256);
+    case "escrow":
+      return (
+        isAgreementShape(payload.agreement) &&
+        isText(payload.address, 256) &&
+        isText(payload.refundAddress, 256)
+      );
+    case "funded":
+      return (
+        isText(payload.txid, 128) &&
+        Number.isSafeInteger(payload.vout) &&
+        (payload.vout as number) >= 0 &&
+        isPositiveNumber(payload.amount)
+      );
+    case "fiat_sent":
+      return true;
+    case "release_request":
+      return isSpend(payload.spend) && isText(payload.to, 256) && isPositiveNumber(payload.sats);
+    case "release_signed":
+      return isSpend(payload.spend);
+    case "release_done":
+      return isText(payload.arkTxid, 256);
+    case "cancel_request":
+    case "cancel_agree":
+      return isOptionalText(payload.reason, 500);
+    case "ark_address":
+      return (
+        isText(payload.arkAddress, 256) &&
+        (payload.agreement === undefined || isAgreementShape(payload.agreement))
+      );
+    case "ark_address_request":
+      return isOptionalText(payload.reason, 500);
+    case "dispute":
+      return (
+        isText(payload.reason, 500) &&
+        isAgreementShape(payload.agreement) &&
+        isText(payload.buyerArkAddress, 256) &&
+        isText(payload.sellerArkAddress, 256)
+      );
+    case "dispute_taken":
+      return isText(payload.orderId, MAX_ID_LENGTH) && isHex64(payload.solverPubKey);
+    case "arbiter_decision":
+      return (
+        (payload.outcome === "release_to_buyer" || payload.outcome === "refund_to_seller") &&
+        isText(payload.destination, 256) &&
+        isPositiveNumber(payload.sats) &&
+        isText(payload.arkTxid, 256) &&
+        (payload.solverPubKey === undefined || isHex64(payload.solverPubKey))
+      );
+    case "chat":
+      return isText(payload.text);
+    default:
+      return false;
+  }
+}
+
+/** Parse a DM content string, returning `null` when it is not a valid trade message. */
 export function decodeTradeMessage(content: string): TradeMessage | null {
   let data: unknown;
   try {
@@ -180,10 +293,16 @@ export function decodeTradeMessage(content: string): TradeMessage | null {
   } catch {
     return null;
   }
-  if (typeof data !== "object" || data === null) return null;
-  const m = data as Partial<TradeMessageOf<TradeMessageType>>;
-  if (m.app !== TRADE_APP) return null;
-  if (typeof m.type !== "string") return null;
-  if (!(TRADE_TYPES as readonly string[]).includes(m.type)) return null;
-  return m as TradeMessage;
+  if (!isRecord(data)) return null;
+  if (data.app !== TRADE_APP) return null;
+  if (data.v !== TRADE_VERSION) return null;
+  if (typeof data.type !== "string") return null;
+  if (!(TRADE_TYPES as readonly string[]).includes(data.type)) return null;
+  const type = data.type as TradeMessageType;
+  if (!isText(data.orderId, MAX_ID_LENGTH)) return null;
+  if (data.role !== "buyer" && data.role !== "seller") return null;
+  if (!isHex64(data.from)) return null;
+  if (!isPositiveNumber(data.ts)) return null;
+  if (!isValidPayload(type, data.payload)) return null;
+  return data as unknown as TradeMessage;
 }

@@ -25,8 +25,8 @@ export interface Reputation {
 /** A reputation with no reviews yet. */
 export const EMPTY_REPUTATION: Reputation = { average: 0, count: 0, min: 0, max: 0, last: 0 };
 
-/** Star statuses that count as a finished trade (`s` tag on the order). */
-const FINISHED_STATUSES = new Set(["success", "canceled"]);
+/** Only a successfully completed trade can produce reputation. */
+const FINISHED_STATUSES = new Set(["success"]);
 
 /**
  * Decide whether a rating should be counted, given the order it references.
@@ -36,24 +36,34 @@ const FINISHED_STATUSES = new Set(["success", "canceled"]);
  * can reconstruct from public data:
  *
  *  1. The referenced order event exists, parses as a NIP-69 order and its
- *     status is terminal (`success`/`canceled`) — trading really finished.
- *  2. The rating's `y`/`z` tags mark it as ours (enforced by `parseRating`).
- *  3. The declared `ratee` matches the order's maker OR the rater itself is the
- *     maker. This binds the pair to the actual trade participants without
- *     needing the private take.
- *
- * We deliberately do NOT require the rater to be the maker: the taker cannot be
- * proven publicly, so we accept a signed self-declaration, relying on the
- * one-rating-per-(rater, order) rule (addressable `d`) to stop spam.
+ *     status is `success` — only completed trades create reputation.
+ *  2. The rating's `d`/`e`/`y`/`z` tags are well-formed and bound to that exact
+ *     order (enforced by `parseRating` and the order id check below).
+ *  3. The rater and ratee are different keys.
+ *  4. One side is the maker and the other is the taker, and the declared
+ *     `role` matches the side the rater actually played. The taker cannot be
+ *     proven from public data, so this remains a signed self-declaration; it
+ *     no longer permits self-rating, role spoofing or ratings on canceled
+ *     orders.
  */
 export function isRatingAcceptable(rating: Rating, order: Order | null): boolean {
   if (!order) return false;
+  if (order.id !== rating.orderId) return false;
+  if (rating.createdAt < order.createdAt) return false;
   if (!FINISHED_STATUSES.has(order.status)) return false;
   const maker = order.maker.toLowerCase();
-  const ratee = rating.ratee;
-  const rater = rating.rater;
-  // One side of the pair must be the maker; the other is the (unprovable) taker.
-  return ratee === maker || rater === maker;
+  const ratee = rating.ratee.toLowerCase();
+  const rater = rating.rater.toLowerCase();
+  if (rater === ratee) return false;
+  const makerRole: "buyer" | "seller" = order.type === "sell" ? "seller" : "buyer";
+  const takerRole: "buyer" | "seller" = makerRole === "buyer" ? "seller" : "buyer";
+  if (rater === maker) {
+    return ratee !== maker && rating.role === makerRole;
+  }
+  if (ratee === maker) {
+    return rater !== maker && rating.role === takerRole;
+  }
+  return false;
 }
 
 /**
@@ -80,13 +90,13 @@ export async function verifiedRatings(
       cache.set(orderEventId, order);
     }
     if (!order) {
-      // If we cannot fetch/parse the referenced order (e.g. relay latency),
-      // still accept a well-formed, signed rating to keep counts consistent
-      // across clients/tabs.
-      accepted.push(rating);
+      // Fail closed: without the referenced order we cannot prove that a real
+      // trade finished, so the rating does not count.
       continue;
     }
-    if (isRatingAcceptable(rating, order)) accepted.push(rating);
+    if (order.event.id === orderEventId && isRatingAcceptable(rating, order)) {
+      accepted.push(rating);
+    }
   }
   return accepted;
 }

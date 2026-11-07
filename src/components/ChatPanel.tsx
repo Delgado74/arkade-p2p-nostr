@@ -13,9 +13,11 @@ import {
 } from "../lib/trade";
 import {
   pickDisputeTakeTaker,
+  validDisputeTakes,
   type DisputeAnnounce,
   type DisputeResolution,
   type DisputeTake,
+  type SolverRegistry,
 } from "../lib/protocol";
 import { isFinished, statusLabel, type OperationRecord } from "../lib/operations";
 import {
@@ -40,6 +42,7 @@ interface Props {
   disputeAnnounces: DisputeAnnounce[];
   disputeTakes: DisputeTake[];
   disputeResolutions: DisputeResolution[];
+  solverRegistry?: SolverRegistry | null;
   operations: OperationRecord[];
   readMarks: ReadMarks;
   onReadMarksChange: (marks: ReadMarks) => void;
@@ -123,8 +126,10 @@ function orderPeers(orderId: string, feed: TradeDm[], myPubKey: string): string[
 function disputePeers(
   orderId: string,
   feed: TradeDm[],
+  announces: DisputeAnnounce[],
   takes: DisputeTake[],
   myPubKey: string,
+  registrySolvers?: readonly string[] | null,
 ): string[] {
   const me = myPubKey.toLowerCase();
   const agreement = agreementFor(orderId, feed);
@@ -134,9 +139,21 @@ function disputePeers(
     );
     const isSolver = agreement.arbiterPubKeys.some((p) => p.toLowerCase() === me);
     if (isSolver) return parties;
-    const winner = pickDisputeTakeTaker(takes.filter((t) => t.orderId === orderId));
+    const winner = pickDisputeTakeTaker(
+      validDisputeTakes(takes, announces, agreement.arbiterPubKeys).filter(
+        (t) => t.orderId === orderId,
+      ),
+    );
     if (winner && winner.solverPubKey.toLowerCase() !== me) return [winner.solverPubKey];
     return parties;
+  }
+  const registryWinner = pickDisputeTakeTaker(
+    validDisputeTakes(takes, announces, registrySolvers).filter(
+      (t) => t.orderId === orderId,
+    ),
+  );
+  if (registryWinner && registryWinner.solverPubKey.toLowerCase() !== me) {
+    return [registryWinner.solverPubKey];
   }
   return orderPeers(orderId, feed, myPubKey);
 }
@@ -169,6 +186,7 @@ export function ChatPanel({
   disputeAnnounces,
   disputeTakes,
   disputeResolutions,
+  solverRegistry = null,
   operations,
   readMarks,
   onReadMarksChange,
@@ -260,7 +278,14 @@ export function ChatPanel({
   // Peers a dispute message can be addressed to, and the currently selected
   // one (defaulted to the first when the room opens).
   const disputePeerOptions = openDispute
-    ? disputePeers(openDispute.orderId, feed, disputeTakes, identity.pubkeyHex)
+    ? disputePeers(
+        openDispute.orderId,
+        feed,
+        disputeAnnounces,
+        disputeTakes,
+        identity.pubkeyHex,
+        solverRegistry?.solvers,
+      )
     : [];
   const activeDisputePeer =
     disputePeer && disputePeerOptions.includes(disputePeer)
@@ -288,7 +313,14 @@ export function ChatPanel({
     const key = `dispute:${room.orderId}`;
     markRead(key, room.messages);
     try {
-      const peers = disputePeers(room.orderId, feed, disputeTakes, identity.pubkeyHex);
+      const peers = disputePeers(
+        room.orderId,
+        feed,
+        disputeAnnounces,
+        disputeTakes,
+        identity.pubkeyHex,
+        solverRegistry?.solvers,
+      );
       if (peers.length > 0) {
         setDisputePeer(peers[0]);
       } else if ((room as any).peers?.length > 0) {

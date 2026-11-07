@@ -203,7 +203,11 @@ function AppMain({ identity }: { identity: Identity }) {
     if (!identity) return;
     const subscription = subscribeDms(client.pool, client.relays, identity, {
       onMessage: (dm) => {
-        const msg = decodeTradeMessage(dm.content);
+        const decoded = decodeTradeMessage(dm.content);
+        // The trade envelope carries `from`, but only the NIP-17 seal proves
+        // the author. Reject a message whose envelope claims another key.
+        const msg =
+          decoded && decoded.from.toLowerCase() === dm.sender.toLowerCase() ? decoded : null;
         setFeed((prev) =>
           prev.some((entry) => entry.dm.id === dm.id) ? prev : [...prev, { dm, msg }],
         );
@@ -472,12 +476,14 @@ function AppMain({ identity }: { identity: Identity }) {
         disputeResolutions,
         identity.pubkeyHex,
         readMarks,
+        solverRegistry?.solvers,
       ),
     [
       visibleFeed,
       disputeAnnounces,
       disputeTakes,
       disputeResolutions,
+      solverRegistry,
       identity.pubkeyHex,
       readMarks,
     ],
@@ -500,9 +506,22 @@ function AppMain({ identity }: { identity: Identity }) {
   const solverDisputes = useMemo(
     () =>
       isSolver
-        ? buildSolverDisputes(visibleFeed, disputeTakes, disputeResolutions, identity.pubkeyHex)
+        ? buildSolverDisputes(
+            visibleFeed,
+            disputeTakes,
+            disputeResolutions,
+            disputeAnnounces,
+            identity.pubkeyHex,
+          )
         : [],
-    [isSolver, visibleFeed, disputeTakes, disputeResolutions, identity.pubkeyHex],
+    [
+      isSolver,
+      visibleFeed,
+      disputeTakes,
+      disputeResolutions,
+      disputeAnnounces,
+      identity.pubkeyHex,
+    ],
   );
   const solverActive = activeSolverDisputes(solverDisputes);
 
@@ -817,6 +836,7 @@ function AppMain({ identity }: { identity: Identity }) {
               disputeAnnounces={disputeAnnounces}
               disputeTakes={disputeTakes}
               disputeResolutions={disputeResolutions}
+              solverRegistry={solverRegistry}
               operations={operations}
               readMarks={readMarks}
               onReadMarksChange={applyReadMarks}

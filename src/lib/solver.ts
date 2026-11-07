@@ -1,5 +1,8 @@
 import {
   pickDisputeTakeTaker,
+  validDisputeResolutions,
+  validDisputeTakes,
+  type DisputeAnnounce,
   type DisputeResolution,
   type DisputeTake,
   type SolverRegistry,
@@ -42,6 +45,7 @@ export function buildSolverDisputes(
   feed: TradeDm[],
   takes: DisputeTake[],
   resolutions: DisputeResolution[],
+  announces: DisputeAnnounce[],
   myPubKey: string,
 ): SolverDispute[] {
   const me = myPubKey.toLowerCase();
@@ -54,6 +58,9 @@ export function buildSolverDisputes(
       tradeSats: number;
       fiat: string;
       fiatAmount: number;
+      solvers: string[];
+      buyerPubKey: string;
+      sellerPubKey: string;
     }
   >();
 
@@ -71,14 +78,30 @@ export function buildSolverDisputes(
       tradeSats: msg.payload.agreement.tradeSats,
       fiat: msg.payload.agreement.fiat,
       fiatAmount: msg.payload.agreement.fiatAmount,
+      solvers,
+      buyerPubKey: msg.payload.agreement.buyerPubKey.toLowerCase(),
+      sellerPubKey: msg.payload.agreement.sellerPubKey.toLowerCase(),
     });
   }
 
   const disputes: SolverDispute[] = [];
   for (const [orderId, base] of incoming) {
-    const orderTakes = takes.filter((t) => t.orderId === orderId);
+    const orderAnnounces = announces.filter(
+      (announce) =>
+        announce.orderId === orderId &&
+        (announce.initiator.toLowerCase() === base.buyerPubKey ||
+          announce.initiator.toLowerCase() === base.sellerPubKey),
+    );
+    const orderTakes = validDisputeTakes(takes, orderAnnounces, base.solvers).filter(
+      (t) => t.orderId === orderId,
+    );
     const winner = pickDisputeTakeTaker(orderTakes);
-    const resolution = resolutions
+    const resolution = validDisputeResolutions(
+      resolutions,
+      orderAnnounces,
+      orderTakes,
+      base.solvers,
+    )
       .filter((r) => r.orderId === orderId)
       .sort((a, b) => b.createdAt - a.createdAt)[0];
     const status: SolverDisputeStatus = resolution
