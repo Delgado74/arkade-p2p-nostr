@@ -57,6 +57,15 @@ export const EscrowPath = {
 export type EscrowPath = (typeof EscrowPath)[keyof typeof EscrowPath];
 
 /**
+ * Version of the escrow agreement/script contract.
+ *
+ * Increment only for a consensus-breaking change to the script or the meaning
+ * of its fields. Peers must reject agreements with a different version rather
+ * than deriving an address from fields they do not understand.
+ */
+export const ESCROW_VERSION = 1;
+
+/**
  * Default escrow timelock *duration* (~24h), in seconds.
  *
  * `OP_CHECKLOCKTIMEVERIFY` operands are **absolute**: values below
@@ -90,9 +99,10 @@ export interface EscrowConfig {
   /**
    * Absolute CLTV timelock (Unix seconds, or a block height) after which the
    * seller may reclaim the escrow through the `refund` leaf. Committed into the
-   * script, so both parties must agree on it. Defaults to ~24h after now.
+   * script, so both parties must agree on it. It is mandatory: a script built
+   * from different `Date.now()` calls would give each peer a different address.
    */
-  refundLocktime?: bigint;
+  refundLocktime: bigint;
 }
 
 /** A solver leaf embedded in the escrow. */
@@ -164,11 +174,14 @@ function toXOnlyArray(keys: Uint8Array[]): Uint8Array[] {
  * which stamps the `refund` leaf.
  */
 export function buildEscrow(config: EscrowConfig, network: Network): Escrow {
+  if (typeof config.refundLocktime !== "bigint" || config.refundLocktime <= 0n) {
+    throw new Error("refundLocktime is required and must be a positive absolute timelock");
+  }
   const buyer = toXOnly(config.buyerPubKey, "buyer");
   const seller = toXOnly(config.sellerPubKey, "seller");
   const server = toXOnly(config.serverPubKey, "server");
   const solverSet = toXOnlyArray(config.arbiterPubKeys);
-  const refundLocktime = config.refundLocktime ?? refundLocktimeFrom(Date.now() / 1000);
+  const refundLocktime = config.refundLocktime;
 
   const release = MultisigTapscript.encode({ pubkeys: [buyer, seller, server] });
   const refund = CLTVMultisigTapscript.encode({
@@ -228,28 +241,35 @@ export function buildEscrow(config: EscrowConfig, network: Network): Escrow {
  * import between `escrow.ts` and `trade.ts`.
  */
 export interface AgreementKeys {
+  escrowVersion: number;
   buyerPubKey: string;
   sellerPubKey: string;
   arbiterPubKeys: string[];
   serverPubKey: string;
-  refundLocktime?: string;
+  refundLocktime: string;
 }
 
 /**
  * Decode an agreement into escrow config and build the escrow. Both parties
  * call this with the same agreement, so they derive an identical script.
+ *
+ * Refuses agreements without an explicitly supported version or locktime: a
+ * fallback would make the derived address depend on the local wall clock.
  */
 export function escrowFromAgreement(agreement: AgreementKeys, network: Network): Escrow {
+  if (agreement.escrowVersion !== ESCROW_VERSION) {
+    throw new Error(`unsupported escrow version: ${String(agreement.escrowVersion)}`);
+  }
+  if (typeof agreement.refundLocktime !== "string" || !/^\d+$/.test(agreement.refundLocktime)) {
+    throw new Error("agreement is missing a valid absolute refundLocktime");
+  }
   return buildEscrow(
     {
       buyerPubKey: hex.decode(agreement.buyerPubKey),
       sellerPubKey: hex.decode(agreement.sellerPubKey),
       arbiterPubKeys: agreement.arbiterPubKeys.map((x) => hex.decode(x)),
       serverPubKey: hex.decode(agreement.serverPubKey),
-      refundLocktime:
-        agreement.refundLocktime !== undefined
-          ? BigInt(agreement.refundLocktime)
-          : refundLocktimeFrom(Date.now() / 1000),
+      refundLocktime: BigInt(agreement.refundLocktime),
     },
     network,
   );
@@ -282,14 +302,19 @@ export interface EscrowVtxo {
   recoverable: boolean;
 }
 
-function classifyEscrowVtxo(vtxo: VirtualCoin): EscrowVtxo {
+export function classifyEscrowVtxo(vtxo: VirtualCoin): EscrowVtxo {
   const now = { timestamp: new Date() };
-  const spendable = canSpendOffchain(vtxo, now);
   const recoverable = canRecoverOnchain(vtxo, now);
-  const state: EscrowVtxoState = spendable
-    ? "spendable"
-    : recoverable
-      ? "recoverable"
+  const preconfirmed =
+    vtxo.isPreconfirmed === true || vtxo.virtualStatus?.state === "preconfirmed";
+  // A preconfirmed VTXO is spendable in the SDK's broad sense, but spending it
+  // before the batch settles can lose it to a sweep. Keep it `pending` so every
+  // caller waits for settlement.
+  const spendable = !preconfirmed && canSpendOffchain(vtxo, now);
+  const state: EscrowVtxoState = recoverable
+    ? "recoverable"
+    : spendable
+      ? "spendable"
       : "pending";
   return { vtxo, state, spendable, recoverable };
 }

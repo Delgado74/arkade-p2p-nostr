@@ -1,4 +1,4 @@
-import type { SerializedSpend } from "./escrow";
+import { ESCROW_VERSION, type SerializedSpend } from "./escrow";
 import type { DirectMessage } from "./dm";
 
 /** Application tag embedded in every trade message to reject unrelated DMs. */
@@ -15,6 +15,8 @@ export type TradeRole = "buyer" | "seller";
  * address; the server key comes from the ASP the seller published.
  */
 export interface EscrowAgreement {
+  /** Must equal {@link ESCROW_VERSION}; peers reject unknown versions. */
+  escrowVersion: number;
   orderId: string;
   /** Fiat code, e.g. `USD`. */
   fiat: string;
@@ -30,11 +32,12 @@ export interface EscrowAgreement {
   /** ASP co-signer x-only hex pubkey (`hex.encode(ctx.serverPubKey)`). */
   serverPubKey: string;
   /**
-   * Absolute timelock (in blocks) of the escrow's `refund` leaf, as a string to
-   * survive JSON. Both parties must agree on it so they derive the same script.
-   * Absent on legacy agreements, in which case the default is used.
+   * Absolute timelock (Unix seconds, or a block height) of the escrow's
+   * `refund` leaf, as a string to survive JSON. Both parties must agree on it
+   * so they derive the same script. It is mandatory: without it the two peers
+   * would each fall back to their own clock and derive different addresses.
    */
-  refundLocktime?: string;
+  refundLocktime: string;
 }
 
 /** Payload variants keyed by message type. */
@@ -173,6 +176,7 @@ export function encodeTradeMessage<K extends TradeMessageType>(msg: TradeMessage
 }
 
 const HEX64 = /^[0-9a-f]{64}$/i;
+const UINT = /^\d+$/;
 const MAX_ID_LENGTH = 256;
 const MAX_TEXT_LENGTH = 10000;
 
@@ -219,7 +223,9 @@ function isAgreementShape(value: unknown): boolean {
     value.arbiterPubKeys.length > 0 &&
     value.arbiterPubKeys.every(isHex64) &&
     isHex64(value.serverPubKey) &&
-    (value.refundLocktime === undefined || typeof value.refundLocktime === "string")
+    value.escrowVersion === ESCROW_VERSION &&
+    typeof value.refundLocktime === "string" &&
+    UINT.test(value.refundLocktime)
   );
 }
 

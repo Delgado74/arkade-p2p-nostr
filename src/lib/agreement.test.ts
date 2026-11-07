@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { validateAgreement, type AgreementValidationContext } from "./agreement";
+import { ESCROW_VERSION } from "./escrow";
 import type { EscrowAgreement } from "./trade";
 
 const NOW = 1_700_000_000;
@@ -10,6 +11,7 @@ const SOLVER = "44".repeat(32);
 
 function agreement(overrides: Partial<EscrowAgreement> = {}): EscrowAgreement {
   return {
+    escrowVersion: ESCROW_VERSION,
     orderId: "order-1",
     fiat: "USD",
     fiatAmount: 25,
@@ -52,6 +54,15 @@ describe("validateAgreement", () => {
       errors: [],
       warnings: [],
     });
+  });
+
+  it("rejects missing or unsupported escrow versions", () => {
+    expect(errors(agreement({ escrowVersion: undefined as unknown as number }))).toContain(
+      "el acuerdo usa una versión de escrow no soportada",
+    );
+    expect(errors(agreement({ escrowVersion: ESCROW_VERSION + 1 }))).toContain(
+      "el acuerdo usa una versión de escrow no soportada",
+    );
   });
 
   it("rejects a solver that is not in the trusted registry", () => {

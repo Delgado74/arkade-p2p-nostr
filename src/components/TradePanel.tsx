@@ -12,6 +12,7 @@ import {
   assertFunded,
   buildSpend,
   coSignSpend,
+  ESCROW_VERSION,
   EscrowPath,
   escrowFromAgreement,
   listEscrowVtxos,
@@ -874,6 +875,7 @@ export function TradePanel({
       // and the maturity check out of step with the network.
       const chainNow = await chainTimeSeconds(ctx);
       const agr: EscrowAgreement = {
+        escrowVersion: ESCROW_VERSION,
         orderId: effectiveOrderId,
         fiat: fiat.trim().toUpperCase(),
         fiatAmount: Number(fiatAmount),

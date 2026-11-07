@@ -1,9 +1,14 @@
 import { useState } from "react";
 import { hex } from "@scure/base";
 import type { VirtualCoin } from "@arkade-os/sdk";
-import type { ArkContext } from "../lib/arkade";
+import { chainTimeSeconds, type ArkContext } from "../lib/arkade";
 import type { Identity } from "../lib/identity";
-import { buildEscrow, findEscrowVtxo, type Escrow } from "../lib/escrow";
+import {
+  buildEscrow,
+  findEscrowVtxo,
+  refundLocktimeFrom,
+  type Escrow,
+} from "../lib/escrow";
 
 interface Props {
   identity: Identity | null;
@@ -36,6 +41,7 @@ export function EscrowHarness({ identity, ctx }: Props) {
           sellerPubKey: await identity.ark.xOnlyPublicKey(),
           arbiterPubKeys: arbiterKey ? [hex.decode(arbiterKey)] : [],
           serverPubKey: ctx.serverPubKey,
+          refundLocktime: refundLocktimeFrom(await chainTimeSeconds(ctx)),
         },
         ctx.network,
       );

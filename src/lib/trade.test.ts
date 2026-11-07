@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ESCROW_VERSION } from "./escrow";
 import { decodeTradeMessage, TRADE_APP, TRADE_VERSION } from "./trade";
 
 const HEX = (n: number) => n.toString(16).padStart(64, "0");
@@ -56,6 +57,7 @@ describe("decodeTradeMessage runtime validation", () => {
 
   it("rejects an escrow agreement with an empty solver set", () => {
     const agreement = {
+      escrowVersion: ESCROW_VERSION,
       orderId: "order-1",
       fiat: "USD",
       fiatAmount: 25,
@@ -64,10 +66,49 @@ describe("decodeTradeMessage runtime validation", () => {
       sellerPubKey: HEX(3),
       arbiterPubKeys: [],
       serverPubKey: HEX(4),
+      refundLocktime: "1700000000",
     };
     expect(
       decodeTradeMessage(
         message("escrow", { agreement, address: "ark1q...", refundAddress: "ark1r..." }),
+      ),
+    ).toBeNull();
+  });
+
+  it("rejects legacy or unknown escrow agreement versions", () => {
+    const agreement = {
+      escrowVersion: ESCROW_VERSION,
+      orderId: "order-1",
+      fiat: "USD",
+      fiatAmount: 25,
+      tradeSats: 10000,
+      buyerPubKey: HEX(2),
+      sellerPubKey: HEX(3),
+      arbiterPubKeys: [HEX(4)],
+      serverPubKey: HEX(5),
+      refundLocktime: "1700000000",
+    };
+    expect(
+      decodeTradeMessage(
+        message("escrow", { agreement, address: "ark1q...", refundAddress: "ark1r..." }),
+      )?.type,
+    ).toBe("escrow");
+    expect(
+      decodeTradeMessage(
+        message("escrow", {
+          agreement: { ...agreement, escrowVersion: undefined },
+          address: "ark1q...",
+          refundAddress: "ark1r...",
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      decodeTradeMessage(
+        message("escrow", {
+          agreement: { ...agreement, escrowVersion: ESCROW_VERSION + 1 },
+          address: "ark1q...",
+          refundAddress: "ark1r...",
+        }),
       ),
     ).toBeNull();
   });

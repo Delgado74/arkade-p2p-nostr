@@ -47,19 +47,28 @@ export function computeWindowState(args: {
 }): WindowState {
   const { feed, orderId, role, isMaker, funded, now } = args;
   const forOrder = feed.filter((e) => e.msg?.orderId === orderId);
-  const takeReceivedAt =
-    forOrder.find((e) => e.msg?.type === "take" && !e.dm.outgoing)?.dm.createdAt ?? null;
-  const takerAddressAt =
-    forOrder
-      .find((e) => {
-        if (e.dm.outgoing) return false;
-        if (e.msg?.type === "taker_address") return true;
-        if (e.msg?.type === "take" && e.msg.payload.buyerArkAddress) return true;
-        return false;
-      })
-      ?.dm.createdAt ?? null;
-  const escrowPublishedAt =
-    forOrder.find((e) => e.msg?.type === "escrow")?.dm.createdAt ?? null;
+
+  function earliest(predicate: (entry: TradeDm) => boolean): number | null {
+    let found: number | null = null;
+    for (const entry of forOrder) {
+      if (!predicate(entry)) continue;
+      if (found === null || entry.dm.createdAt < found) found = entry.dm.createdAt;
+    }
+    return found;
+  }
+
+  // Use the earliest matching message, not the first array element: relays can
+  // deliver events out of order and can replay them. A duplicate take must not
+  // reset the taker's window.
+  const takeReceivedAt = earliest(
+    (e) => e.msg?.type === "take" && !e.dm.outgoing,
+  );
+  const takerAddressAt = earliest((e) => {
+    if (e.dm.outgoing) return false;
+    if (e.msg?.type === "taker_address") return true;
+    return e.msg?.type === "take" && Boolean(e.msg.payload.buyerArkAddress);
+  });
+  const escrowPublishedAt = earliest((e) => e.msg?.type === "escrow");
 
   const takerWindowExpired =
     isMaker &&

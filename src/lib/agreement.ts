@@ -8,6 +8,8 @@
  * policy. Both sides must validate it before funding or spending the escrow.
  */
 
+import { ESCROW_VERSION } from "./escrow";
+
 const HEX64 = /^[0-9a-f]{64}$/i;
 const UINT = /^\d+$/;
 const FIAT = /^[A-Za-z0-9]{2,16}$/;
@@ -85,6 +87,11 @@ export function validateAgreement(
 
   if (!isRecord(input)) {
     return { ok: false, errors: ["el acuerdo no es un objeto válido"], warnings };
+  }
+
+  const escrowVersion = input.escrowVersion;
+  if (escrowVersion !== ESCROW_VERSION) {
+    pushOnce(errors, "el acuerdo usa una versión de escrow no soportada");
   }
 
   const orderId = input.orderId;
