@@ -24,7 +24,14 @@ import type {
 import { buildOrderTemplate } from "./lib/protocol";
 import { coordinatorPubKey } from "./lib/config";
 import { computeWindowState } from "./lib/windows";
-import { isFinished, loadOperations, recordOperation, type OperationRecord } from "./lib/operations";
+import {
+  isFinished,
+  loadOperations,
+  loadOperationsFromDaemon,
+  recordOperation,
+  syncOperation,
+  type OperationRecord,
+} from "./lib/operations";
 import {
   buildConversations,
   buildDisputeRooms,
@@ -118,6 +125,12 @@ function AppMain({ identity }: { identity: Identity }) {
   const [operations, setOperations] = useState<OperationRecord[]>(() =>
     loadOperations(identity.pubkeyHex),
   );
+  // Latest operations, readable from callbacks that must not re-subscribe on
+  // every change (the DM feed, for instance).
+  const operationsRef = useRef(operations);
+  useEffect(() => {
+    operationsRef.current = operations;
+  }, [operations]);
   const [readMarks, setReadMarks] = useState<ReadMarks>(() => loadReadMarks(identity.pubkeyHex));
   // Bumped after publishing an order so the book refetches immediately instead
   // of waiting for a relay push.
@@ -141,7 +154,12 @@ function AppMain({ identity }: { identity: Identity }) {
 
   const record = useCallback(
     (orderId: string, patch: Partial<OperationRecord>) => {
-      setOperations(recordOperation(identity.pubkeyHex, orderId, patch));
+      const next = recordOperation(identity.pubkeyHex, orderId, patch);
+      operationsRef.current = next;
+      setOperations(next);
+      // The daemon is the source of truth; the local write above is the
+      // synchronous cache that keeps the UI responsive and offline-capable.
+      void syncOperation(orderId, patch);
       // A finished operation wipes its private thread: the chat leaves no
       // trace in this session, neither in the feed nor in the badge.
       if (patch.status && isFinished(patch.status)) {
@@ -151,15 +169,31 @@ function AppMain({ identity }: { identity: Identity }) {
     [identity.pubkeyHex],
   );
 
+  // On load, migrate the local cache into the daemon and render its history.
+  // If the daemon is unavailable, `loadOperationsFromDaemon` returns the local
+  // copy so the client keeps working.
+  useEffect(() => {
+    let cancelled = false;
+    loadOperationsFromDaemon(identity.pubkeyHex)
+      .then((list) => {
+        if (!cancelled) setOperations(list);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [identity.pubkeyHex]);
+
   // Like `record`, but refuses to reopen a trade that already finished: a
   // re-delivered `take` (or any late "in-progress" signal) must never drag a
   // completed/canceled operation back onto the Operación screen.
-  const recordActive = useCallback(    (orderId: string, patch: Partial<OperationRecord>) => {
-      const existing = loadOperations(identity.pubkeyHex).find((op) => op.orderId === orderId);
+  const recordActive = useCallback(
+    (orderId: string, patch: Partial<OperationRecord>) => {
+      const existing = operationsRef.current.find((op) => op.orderId === orderId);
       if (existing && isFinished(existing.status)) return;
       record(orderId, patch);
     },
-    [identity.pubkeyHex, record],
+    [record],
   );
 
   // Persist a patch on the operation currently open in the trade panel (the

@@ -1,4 +1,5 @@
 import type { TradeRole } from "./trade";
+import { daemonClient } from "./daemon/client";
 
 /**
  * Lifecycle of a locally tracked trade, from the local user's point of view.
@@ -148,4 +149,93 @@ export function recordOperation(
   const next = [merged, ...list.filter((op) => op.orderId !== orderId)];
   persist(pubkey, next);
   return next;
+}
+
+/**
+ * RPC surface the operation store needs. Injectable so the migration logic can
+ * be tested without a live daemon.
+ */
+export interface OperationsRpc {
+  call<T = any>(method: string, params?: any): Promise<T>;
+}
+
+interface ImportResult {
+  imported: number;
+  skipped: number;
+}
+
+/** Fields the daemon accepts on `operations.upsert`; identity/timestamps are not patches. */
+function toPatch(patch: Partial<OperationRecord>): Partial<OperationRecord> {
+  const {
+    orderId: _orderId,
+    createdAt: _createdAt,
+    updatedAt: _updatedAt,
+    ...rest
+  } = patch;
+  return rest;
+}
+
+/**
+ * Combine the daemon's operations with the local cache, keeping the newest
+ * version of each order. The daemon is authoritative on ties; the local copy
+ * only wins when it is strictly newer (e.g. a write made while it was down).
+ */
+export function mergeOperations(
+  daemon: OperationRecord[],
+  local: OperationRecord[],
+): OperationRecord[] {
+  const byOrder = new Map<string, OperationRecord>();
+  for (const op of daemon) byOrder.set(op.orderId, op);
+  for (const op of local) {
+    const current = byOrder.get(op.orderId);
+    if (!current || op.updatedAt > current.updatedAt) byOrder.set(op.orderId, op);
+  }
+  return [...byOrder.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/**
+ * Load the identity's operations from the daemon, importing the local cache
+ * first so nothing written before this migration is lost.
+ *
+ * The import is idempotent (existing daemon rows win) and the local cache is
+ * kept in sync afterwards, so the client still works if the daemon is down.
+ */
+export async function loadOperationsFromDaemon(
+  pubkey: string,
+  rpc: OperationsRpc = daemonClient,
+): Promise<OperationRecord[]> {
+  const local = loadOperations(pubkey);
+  try {
+    if (local.length > 0) {
+      await rpc.call<ImportResult>("operations.import", { operations: local });
+    }
+    const daemon = await rpc.call<OperationRecord[]>("operations.list", {});
+    const merged = mergeOperations(daemon, loadOperations(pubkey));
+    // Push rows that are newer locally than in the daemon (failed writes), so
+    // the daemon catches up without waiting for the next trade update.
+    for (const op of merged) {
+      const remote = daemon.find((entry) => entry.orderId === op.orderId);
+      if (!remote || op.updatedAt > remote.updatedAt) {
+        await rpc.call("operations.upsert", { orderId: op.orderId, patch: toPatch(op) });
+      }
+    }
+    persist(pubkey, merged);
+    return merged;
+  } catch {
+    // Daemon unavailable: keep working from the local cache.
+    return local;
+  }
+}
+
+/** Mirror one operation update to the daemon; the local cache is already written. */
+export async function syncOperation(
+  orderId: string,
+  patch: Partial<OperationRecord>,
+  rpc: OperationsRpc = daemonClient,
+): Promise<void> {
+  try {
+    await rpc.call("operations.upsert", { orderId, patch: toPatch(patch) });
+  } catch {
+    // The local cache keeps the change; the next load retries the sync.
+  }
 }
