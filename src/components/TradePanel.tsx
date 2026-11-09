@@ -28,6 +28,7 @@ import {
   type EscrowVtxoState,
 } from "../lib/escrow";
 import { derivePersonalArkAddress } from "../lib/escrowWallet";
+import { syncEscrow } from "../lib/daemon/state";
 import { recoverEscrowVtxos } from "../lib/recovery";
 import { validateAgreement, type AgreementValidation } from "../lib/agreement";
 import {
@@ -589,6 +590,37 @@ export function TradePanel({
       escrow = null;
     }
   }
+
+  // Mirror the derived escrow into the daemon so a reload can rebuild the
+  // trade without replaying every DM. Best-effort: the UI owns nothing durable.
+  const escrowAddress = escrow?.address ?? null;
+  const vtxoTxid = vtxo?.txid;
+  const vtxoVout = vtxo?.vout;
+  const hasVtxo = vtxo !== null;
+  const escrowSync = useMemo(() => {
+    if (!agreement || !escrowAddress || !effectiveOrderId) return null;
+    return {
+      orderId: effectiveOrderId,
+      address: escrowAddress,
+      agreement,
+      state: localEscrowState ?? (hasVtxo ? ("spendable" as const) : ("created" as const)),
+      vtxoTxid,
+      vtxoVout,
+      fundedSats: fundedSats ?? undefined,
+    };
+  }, [
+    agreement,
+    escrowAddress,
+    effectiveOrderId,
+    localEscrowState,
+    hasVtxo,
+    vtxoTxid,
+    vtxoVout,
+    fundedSats,
+  ]);
+  useEffect(() => {
+    if (escrowSync) void syncEscrow(escrowSync);
+  }, [escrowSync]);
 
   // Re-render roughly once a minute so the timelock state stays current.
   // `chainSec` tracks the chain's median-time-past (what the CLTV is actually

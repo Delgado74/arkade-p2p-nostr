@@ -42,6 +42,7 @@ import {
   type ReadMarks,
 } from "./lib/chat";
 import { loadStoredDms } from "./lib/daemon/messages";
+import { syncDispute } from "./lib/daemon/state";
 import { OrderForm } from "./components/OrderForm";
 import { OrderBook } from "./components/OrderBook";
 import DaemonSetup from "./components/DaemonSetup";
@@ -566,6 +567,35 @@ function AppMain({ identity }: { identity: Identity }) {
       readMarks,
     ],
   );
+  // Persist each public dispute lifecycle in the daemon. Rooms are already
+  // memoized, so this only runs when the underlying events change.
+  const disputeRecords = useMemo(
+    () =>
+      disputeRooms.map((room) => {
+        const announce = disputeAnnounces.find((a) => a.orderId === room.orderId);
+        const take = room.winner
+          ? disputeTakes.find(
+              (t) => t.orderId === room.orderId && t.solverPubKey === room.winner,
+            )
+          : undefined;
+        const resolution = disputeResolutions.find((r) => r.orderId === room.orderId);
+        return {
+          orderId: room.orderId,
+          status: room.status,
+          initiator: room.initiator,
+          winner: room.winner,
+          reason: room.reason,
+          announceEventId: announce?.event.id,
+          takeEventId: take?.event.id,
+          resolutionEventId: resolution?.event.id,
+        };
+      }),
+    [disputeRooms, disputeAnnounces, disputeTakes, disputeResolutions],
+  );
+  useEffect(() => {
+    for (const record of disputeRecords) void syncDispute(record);
+  }, [disputeRecords]);
+
   // Mirror exactly what the Chat screen lists: our own trades (not a solver's
   // broadcast traffic) plus every dispute room, so the badge never shows a
   // count with no visible room behind it.

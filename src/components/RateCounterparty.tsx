@@ -3,6 +3,7 @@ import type { NostrClient } from "../lib/nostr";
 import type { Identity } from "../lib/identity";
 import type { OperationRecord } from "../lib/operations";
 import { StarRating } from "./StarRating";
+import { syncRating } from "../lib/daemon/state";
 
 interface Props {
   client: NostrClient;
@@ -46,12 +47,20 @@ export function RateCounterparty({ client, identity, op, onRated }: Props) {
       if (!orderEventId) {
         throw new Error("no se encontró la orden pública para vincular la calificación");
       }
-      await client.publishRating(identity, {
+      const event = await client.publishRating(identity, {
         orderId: op.orderId,
         orderEventId,
         ratee: op.counterparty,
         value: stars,
         role: op.role,
+      });
+      void syncRating({
+        eventId: event.id,
+        orderId: op.orderId,
+        author: identity.pubkeyHex,
+        subject: op.counterparty,
+        score: stars,
+        createdAt: event.created_at,
       });
       setValue(stars);
       onRated(stars);
