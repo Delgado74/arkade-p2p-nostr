@@ -12,15 +12,26 @@ export interface DaemonRpcResponse<T = any> {
   error?: { code: number; message: string };
 }
 
+export type DaemonNotificationHandler = (method: string, params: any) => void;
+
 export class DaemonClient {
   private ws: WebSocket | null = null;
   private url: string;
   private id = 0;
   private pending = new Map<number | string, (res: DaemonRpcResponse) => void>();
+  private notificationHandlers = new Set<DaemonNotificationHandler>();
   private connecting: Promise<void> | null = null;
 
   constructor(url = import.meta.env.VITE_DAEMON_URL?.trim() || "ws://127.0.0.1:9100") {
     this.url = url;
+  }
+
+  /** Listen to server-initiated notifications (subscription events, `hello`). */
+  onNotification(handler: DaemonNotificationHandler): () => void {
+    this.notificationHandlers.add(handler);
+    return () => {
+      this.notificationHandlers.delete(handler);
+    };
   }
 
   connect(): Promise<void> {
@@ -41,11 +52,15 @@ export class DaemonClient {
       };
       ws.onmessage = (ev) => {
         try {
-          const msg = JSON.parse(ev.data) as DaemonRpcResponse;
+          const msg = JSON.parse(ev.data) as DaemonRpcResponse & { method?: string; params?: any };
           if (msg.id !== undefined && this.pending.has(msg.id)) {
             const fn = this.pending.get(msg.id)!;
             this.pending.delete(msg.id);
             fn(msg);
+            return;
+          }
+          if (typeof msg.method === "string") {
+            for (const handler of this.notificationHandlers) handler(msg.method, msg.params);
           }
         } catch {}
       };

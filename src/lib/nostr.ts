@@ -1,4 +1,3 @@
-import { SimplePool } from "nostr-tools/pool";
 import type { Event, EventTemplate } from "nostr-tools/pure";
 import type { Filter } from "nostr-tools/filter";
 import {
@@ -28,6 +27,7 @@ import {
 } from "./protocol";
 import type { Identity } from "./identity";
 import { daemonClient } from "./daemon/client";
+import { DaemonPool } from "./daemon/pool";
 
 /** NIP-09 event kind used to request deletion of an order. */
 export const DELETION_KIND = 5;
@@ -78,16 +78,17 @@ export interface OrderSubscription {
 /**
  * Thin Nostr client scoped to NIP-69 order events.
  *
- * Uses an ephemeral `SimplePool`; call {@link close} to tear down connections.
+ * Relay connections live in the daemon; this class forwards queries,
+ * publications and subscriptions through {@link DaemonPool}.
  */
 export class NostrClient {
   readonly relays: string[];
-  /** Shared connection pool (also used for NIP-17 DMs). */
-  readonly pool: SimplePool;
+  /** Daemon-backed relay pool (also used for NIP-17 DMs). */
+  readonly pool: DaemonPool;
 
   constructor(relays: string[] = relayList()) {
     this.relays = relays;
-    this.pool = new SimplePool();
+    this.pool = new DaemonPool();
   }
 
   /** Sign and publish a template; succeeds if at least one relay accepts it. */

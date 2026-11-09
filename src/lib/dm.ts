@@ -1,7 +1,7 @@
-import type { SimplePool } from "nostr-tools/pool";
 import type { Event } from "nostr-tools/pure";
 import type { Filter } from "nostr-tools/filter";
 import type { Identity } from "./identity";
+import type { DaemonPool } from "./daemon/pool";
 import { daemonClient } from "./daemon/client";
 
 /** Gift-wrap kind used by NIP-17 private direct messages. */
@@ -45,7 +45,7 @@ interface DaemonRumor {
  * @returns The gift-wrapped event destined to the recipient.
  */
 export async function sendDm(
-  pool: SimplePool,
+  pool: DaemonPool,
   relays: string[],
   _identity: Identity,
   recipientPubKey: string,
@@ -102,7 +102,7 @@ export interface SubscribeDmOptions {
  * (with `outgoing: true`); duplicates across relays are de-duplicated by rumor id.
  */
 export function subscribeDms(
-  pool: SimplePool,
+  pool: DaemonPool,
   relays: string[],
   identity: Identity,
   options: SubscribeDmOptions,
