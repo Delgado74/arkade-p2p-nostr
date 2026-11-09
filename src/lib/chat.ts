@@ -11,6 +11,7 @@ import {
   type DisputeTake,
 } from "./protocol";
 import { summarize } from "./summary";
+import { daemonClient } from "./daemon/client";
 
 /** One rendered line of a chat room (a DM or a synthesized system notice). */
 export interface ChatMessage {
@@ -91,6 +92,89 @@ export function saveReadMarks(pubkey: string, marks: ReadMarks): void {
   } catch {
     // Storage unavailable: unread badges stay session-only.
   }
+}
+
+/** RPC surface needed to persist read marks (injectable for tests). */
+export interface ReadMarksRpc {
+  call<T = any>(method: string, params?: any): Promise<T>;
+}
+
+function readMarksSettingKey(pubkey: string): string {
+  return `readMarks:${pubkey}`;
+}
+
+/** Parse the JSON stored in the daemon; ignore malformed or foreign values. */
+function parseReadMarks(raw: string | null): ReadMarks {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return {};
+    const marks: ReadMarks = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === "number" && Number.isFinite(value)) marks[key] = value;
+    }
+    return marks;
+  } catch {
+    return {};
+  }
+}
+
+/** Per-conversation max, so merging never moves a read mark backwards. */
+export function mergeReadMarks(a: ReadMarks, b: ReadMarks): ReadMarks {
+  const merged: ReadMarks = { ...a };
+  for (const [key, value] of Object.entries(b)) {
+    merged[key] = Math.max(merged[key] ?? 0, value);
+  }
+  return merged;
+}
+
+/**
+ * Load read marks from the daemon, importing the local cache first so nothing
+ * marked before this migration is lost.
+ *
+ * The daemon copy wins on a tie (it is shared across devices); the local copy
+ * only advances a mark. A daemon failure returns the local cache unchanged.
+ */
+export async function loadReadMarksFromDaemon(
+  pubkey: string,
+  rpc: ReadMarksRpc = daemonClient,
+): Promise<ReadMarks> {
+  const local = loadReadMarks(pubkey);
+  if (!pubkey) return local;
+  try {
+    const key = readMarksSettingKey(pubkey);
+    const raw = await rpc.call<string | null>("settings.get", { key });
+    const remote = parseReadMarks(raw);
+    const merged = mergeReadMarks(remote, local);
+    saveReadMarks(pubkey, merged);
+    if (raw === null || JSON.stringify(remote) !== JSON.stringify(merged)) {
+      await rpc.call("settings.set", { key, value: JSON.stringify(merged) });
+    }
+    return merged;
+  } catch {
+    return local;
+  }
+}
+
+/**
+ * Persist read marks to the local cache synchronously and mirror them to the
+ * daemon. A daemon failure is swallowed: the local cache still drives the UI
+ * and the next load retries the migration.
+ */
+export function saveReadMarksToDaemon(
+  pubkey: string,
+  marks: ReadMarks,
+  rpc: ReadMarksRpc = daemonClient,
+): Promise<void> {
+  saveReadMarks(pubkey, marks);
+  if (!pubkey) return Promise.resolve();
+  return rpc
+    .call("settings.set", {
+      key: readMarksSettingKey(pubkey),
+      value: JSON.stringify(marks),
+    })
+    .then(() => undefined)
+    .catch(() => undefined);
 }
 
 /** The counterparty of a DM: the other `p` tag on our own copies. */

@@ -37,9 +37,11 @@ import {
   buildDisputeRooms,
   isOurTradeConversation,
   loadReadMarks,
-  saveReadMarks,
+  loadReadMarksFromDaemon,
+  saveReadMarksToDaemon,
   type ReadMarks,
 } from "./lib/chat";
+import { loadStoredDms } from "./lib/daemon/messages";
 import { OrderForm } from "./components/OrderForm";
 import { OrderBook } from "./components/OrderBook";
 import DaemonSetup from "./components/DaemonSetup";
@@ -177,6 +179,48 @@ function AppMain({ identity }: { identity: Identity }) {
     loadOperationsFromDaemon(identity.pubkeyHex)
       .then((list) => {
         if (!cancelled) setOperations(list);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [identity.pubkeyHex]);
+
+  // Rebuild chat history from the daemon database. The relay subscription only
+  // covers a recent window and drops when the tab is closed; the daemon keeps
+  // the decrypted DMs, so a reload restores the whole thread without relying
+  // on relay retention.
+  useEffect(() => {
+    let cancelled = false;
+    loadStoredDms()
+      .then((dms) => {
+        if (cancelled || dms.length === 0) return;
+        setFeed((prev) => {
+          const seen = new Set(prev.map((entry) => entry.dm.id));
+          const merged = [...prev];
+          for (const dm of dms) {
+            if (seen.has(dm.id)) continue;
+            const decoded = decodeTradeMessage(dm.content);
+            const msg =
+              decoded && decoded.from.toLowerCase() === dm.sender.toLowerCase() ? decoded : null;
+            merged.push({ dm, msg });
+          }
+          return merged.sort((a, b) => a.dm.createdAt - b.dm.createdAt);
+        });
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [identity.pubkeyHex]);
+
+  // Read marks are UI state shared across devices: mirror them to the daemon
+  // and merge the local cache on load so unread badges survive a reload.
+  useEffect(() => {
+    let cancelled = false;
+    loadReadMarksFromDaemon(identity.pubkeyHex)
+      .then((marks) => {
+        if (!cancelled) setReadMarks(marks);
       })
       .catch(() => undefined);
     return () => {
@@ -602,7 +646,7 @@ function AppMain({ identity }: { identity: Identity }) {
 
   function applyReadMarks(next: ReadMarks) {
     setReadMarks(next);
-    saveReadMarks(identity.pubkeyHex, next);
+    void saveReadMarksToDaemon(identity.pubkeyHex, next);
   }
 
   function reconnectAsp() {

@@ -21,8 +21,12 @@ export interface DirectMessage {
   createdAt: number;
   /** True when the author is the local identity. */
   outgoing: boolean;
-  /** The outer gift-wrap event (for relay bookkeeping). */
-  wrap: Event;
+  /**
+   * The outer gift-wrap event (for relay bookkeeping). Absent when the message
+   * was rebuilt from the daemon database, which only stores the decrypted
+   * rumor.
+   */
+  wrap?: Event;
 }
 
 /** Handle for an active DM subscription. */
